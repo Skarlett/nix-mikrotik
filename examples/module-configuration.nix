@@ -46,7 +46,11 @@
 
     sections = {
       "/interface bridge" = [
-        { name = "bridge"; auto-mac = false; comment = "defconf"; }
+        # `auto-mac = false` with no member ports gives the bridge no MAC to
+        # derive from, and the import dies with "invalid mac address" -- which
+        # is what upstream's example does on a fresh device. Either pin an
+        # admin-mac (as the fleet router does) or let RouterOS choose.
+        { name = "bridge"; comment = "defconf"; }
         { name = "wifi"; }
       ];
 
