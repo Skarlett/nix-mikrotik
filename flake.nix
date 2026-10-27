@@ -1,15 +1,20 @@
 {
   description = "Declarative MikroTik RouterOS configuration: a module class, a build tool, a deploy tool";
 
-  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
+  inputs = {
+    # Unstable, deliberately: this repository ships a module *class* and a CLI,
+    # not a NixOS system, and its consumers (ccpkgs, the lunix fleet) ride
+    # unstable. Pinning a release branch here would evaluate the class with a
+    # different `lib` than the flake that consumes it.
+    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
 
-  outputs = { self, nixpkgs }:
+    flake-parts.url = "github:hercules-ci/flake-parts";
+  };
+
+  outputs = inputs@{ flake-parts, ... }:
     let
-      inherit (nixpkgs) lib;
+      lib = inputs.nixpkgs.lib;
       mt = import ./lib { inherit lib; };
-
-      systems = [ "x86_64-linux" "aarch64-linux" ];
-      eachSystem = lib.genAttrs systems;
 
       # Every example is a list of modules of class "mikrotik".
       exampleModules = {
@@ -25,92 +30,85 @@
         (_: modules: mt.evalMikrotik { inherit modules; })
         exampleModules;
     in
-    {
-      # The module class itself.
-      lib = mt;
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      systems = [ "x86_64-linux" "aarch64-linux" ];
 
-      mikrotikModules = {
-        base = ./modules/base.nix;
-        hardening = ./modules/hardening.nix;
+      flake = {
+        # The module class itself.
+        lib = mt;
+
+        mikrotikModules = {
+          base = ./modules/base.nix;
+          hardening = ./modules/hardening.nix;
+        };
+
+        mikrotikConfigurations = lib.mapAttrs
+          (_: config: {
+            inherit config;
+            script = mt.render config;
+          })
+          evaluated;
       };
 
-      mikrotikConfigurations = lib.mapAttrs
-        (name: config: { inherit config; script = mt.render config; })
-        evaluated;
-
-      # One script derivation per example, per system: `nix build
-      # .#packages.x86_64-linux.mikrotik-example-script`.
-      packages = eachSystem (system:
+      perSystem = { pkgs, config, ... }:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
-          chr = pkgs.callPackage ./chr { };
-        in
-        lib.mapAttrs'
-          (name: config:
-            lib.nameValuePair "mikrotik-${name}-script"
-              (mt.mkRouterScript { inherit pkgs name config; }))
-          evaluated
-        // {
-          nix-mikrotik = pkgs.callPackage ./pkgs/nix-mikrotik.nix { };
-          chr-lab = chr.lab;
-          mikrotik-chr = chr.image;
-          mikrotik-option = chr.optionPackage;
-          default = chr.lab;
-        });
-
-      apps = eachSystem (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
-          chr-lab = {
-            type = "app";
-            program = lib.getExe self.packages.${system}.chr-lab;
-            meta.description = "Boot two MikroTik CHR VMs on a point-to-point link";
-          };
-          nix-mikrotik = {
-            type = "app";
-            program = lib.getExe self.packages.${system}.nix-mikrotik;
-            meta.description = "Build, secret-deliver and deploy RouterOS scripts";
-          };
-          default = self.apps.${system}.chr-lab;
-        });
-
-      checks = eachSystem (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
           chr = pkgs.callPackage ./chr { };
         in
         {
-          # The renderer is byte-compatible with upstream for upstream's own
-          # example, and the module class adds the rest.
-          render = import ./tests/render.nix {
-            inherit pkgs;
-            inherit (mt) render;
-            legacy = evaluated.legacy;
-            example = evaluated.example;
-          };
-
-          # The CLI's secret handling: placeholders listed, substituted, and
-          # refused when a value is missing.
-          cli = import ./tests/cli.nix {
-            inherit pkgs;
+          # One script derivation per example, per system: `nix build
+          # .#packages.x86_64-linux.mikrotik-example-script`.
+          packages = lib.mapAttrs'
+            (name: cfg:
+              lib.nameValuePair "mikrotik-${name}-script"
+                (mt.mkRouterScript { inherit pkgs name; config = cfg; }))
+            evaluated
+          // {
             nix-mikrotik = pkgs.callPackage ./pkgs/nix-mikrotik.nix { };
+            chr-lab = chr.lab;
+            mikrotik-chr = chr.image;
+            mikrotik-option = chr.optionPackage;
+            default = chr.lab;
           };
 
-          # Boot the pinned CHR image and wait for a RouterOS login prompt.
-          chr-smoke = import ./tests/chr-smoke.nix {
-            inherit pkgs;
-            imageFile = chr.imageFile;
+          apps = {
+            chr-lab = {
+              type = "app";
+              program = lib.getExe config.packages.chr-lab;
+              meta.description = "Boot two MikroTik CHR VMs on a point-to-point link";
+            };
+            nix-mikrotik = {
+              type = "app";
+              program = lib.getExe config.packages.nix-mikrotik;
+              meta.description = "Build, secret-deliver and deploy RouterOS scripts";
+            };
+            default = config.apps.chr-lab;
           };
-        });
 
-      devShells = eachSystem (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
-          default = pkgs.mkShell {
+          checks = {
+            # The renderer is byte-compatible with upstream for upstream's own
+            # example, and the module class adds the rest.
+            render = import ./tests/render.nix {
+              inherit pkgs;
+              inherit (mt) render;
+              legacy = evaluated.legacy;
+              example = evaluated.example;
+            };
+
+            # The CLI's secret handling: placeholders listed, substituted, and
+            # refused when a value is missing.
+            cli = import ./tests/cli.nix {
+              inherit pkgs;
+              nix-mikrotik = config.packages.nix-mikrotik;
+            };
+
+            # Boot the pinned CHR image and wait for a RouterOS login prompt.
+            chr-smoke = import ./tests/chr-smoke.nix {
+              inherit pkgs;
+              imageFile = chr.imageFile;
+            };
+          };
+
+          devShells.default = pkgs.mkShell {
             packages = with pkgs; [
               nixpkgs-fmt
               python3
@@ -119,12 +117,12 @@
             ];
             shellHook = ''
               echo "nix-mikrotik dev shell"
-              echo "  nix build .#packages.$(nix eval --impure --raw --expr builtins.currentSystem).mikrotik-example-script"
+              echo "  nix build .#mikrotik-example-script"
               echo "  nix run .#chr-lab -- start"
             '';
           };
-        });
 
-      formatter = eachSystem (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);
+          formatter = pkgs.nixpkgs-fmt;
+        };
     };
 }

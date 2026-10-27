@@ -107,6 +107,46 @@ removal. That last one is unavoidable — `/import` takes a file, not stdin — 
 is why the file is removed in a `finally` block rather than at the end of the
 happy path.
 
+## Clan vars (how the fleet supplies these secrets)
+
+This repository does not declare the generators — a clan vars generator belongs
+to the machine that holds the value, so the fleet's lives in `Infra/lunix`,
+`modules/vars/generators/mikrotik.nix` ([lunix #131](https://codex.unallocatedspace.luni/Infra/lunix/pulls/131)).
+What makes the two halves fit is one convention:
+
+> **the generator's file names are the `mkSecret` names.**
+
+So the directory clan deploys the vars into *is* a secrets directory, and the
+deploy is one command with no mapping layer:
+
+```sh
+# flagship holds the generator; clan deploys its files to
+# /run/secrets/vars/per-machine/<machine>/<generator>/<file>
+nix-mikrotik deploy router.rsc \
+  --host 10.1.0.3 --user admin \
+  --key /run/secrets/vars/per-machine/flagship/mikrotik-homelab-router/ssh-key \
+  --secrets-dir /run/secrets/vars/per-machine/flagship/mikrotik-homelab-router \
+  --verify --expect-hostname homelab
+```
+
+The generator there declares exactly `wg-chr1-luninet`, `wg-chr1-main`,
+`wg-chr1-mgmt` (prompted, persisted — the router is in service and minting new
+keys would break three tunnels), plus a generated `ssh-key`/`ssh-key.pub` pair
+for the deployer. Three of those match `private-key = mkSecret "wg-chr1-…"` in
+`modules/mikrotik/routers/homelab-router.nix`, which is the whole contract.
+
+`--secrets-dir` reads only the files the script asks for, so the directory can
+carry more than the script needs (the public half, for one). `tests/cli.nix`
+exercises exactly this shape: a directory of files named after the
+placeholders.
+
+Where it stops: RouterOS cannot run sops-nix, so a var is **delivered**, not
+activated. Nothing in the fleet's `sops.secrets` reaches the router; the value
+travels from the deployed var, through a temporary file, to the device, and the
+uploaded copy is deleted. `services.mikrotik` (ccpkgs) is the wrapper that
+automates the invocation above as a oneshot unit once it is on the fleet's
+`ccpkgs` pin.
+
 ## Deploying
 
 ```sh

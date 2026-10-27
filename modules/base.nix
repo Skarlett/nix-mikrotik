@@ -137,6 +137,11 @@ in
         failure, and so that the deploy tool can enumerate what it must be
         handed. A secret has no value in the nix store: RouterOS cannot run
         sops-nix, so the value is delivered at deploy time (see README).
+
+        The fleet supplies these from clan vars
+        (`Infra/lunix` `modules/vars/generators/mikrotik.nix`), whose file
+        names are these names — so the deployed var directory can be passed to
+        `nix-mikrotik deploy --secrets-dir` unchanged. See README "Clan vars".
       '';
     };
   };
