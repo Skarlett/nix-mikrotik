@@ -22,12 +22,15 @@ Two things about a RouterOS value this tool has to get right, because the
 device reports neither of them through ssh's exit status:
 
   * a value that is not quoted when RouterOS needs it to be (a base64 key ends
-    in `=`) makes the device abort the *whole* script -- nothing is applied --
-    and `/import` still exits 0. Values are quoted here when they need it.
-  * a script the device refused to parse is indistinguishable from one it
-    applied, by status alone. `deploy` appends a one-line sentinel to the
-    uploaded copy and reads the device's log back, so a deploy that applied
-    nothing fails instead of printing "verified".
+    in `=`) makes the device refuse the script at parse time -- nothing is
+    applied -- and `/import` still exits 0. Values are quoted here when they
+    need it.
+  * a script the device did not finish running is indistinguishable, by status
+    alone, from one it applied. `deploy` appends a one-line sentinel to the
+    uploaded copy and reads the device's log back, so a deploy that did not run
+    to the end fails instead of printing "verified" -- and its message says a
+    prefix may have been applied, because a parse abort applies nothing while a
+    runtime abort has already applied everything above the failing line.
 """
 
 from __future__ import annotations
@@ -332,16 +335,49 @@ def new_sentinel() -> str:
 def sentinel_line(marker: str) -> str:
     """The line appended to the uploaded copy, and why it is there.
 
-    RouterOS compiles an imported script before running any of it, so this line
-    runs only if the whole script ran -- which is what makes a failed import
-    detectable at all. It is a log entry rather than a file so that nothing has
-    to be cleaned up on the device, and the marker is unique per deploy.
+    This line is logged only if the whole script ran. RouterOS exits 0 for an
+    import it refused, so ssh's status cannot say whether anything happened; a
+    script the device cannot *parse* applies nothing and never reaches this
+    line, and one that fails *while running* stops before it. So the sentinel
+    answers "did it run to the end", not "did every line apply". It is a log
+    entry rather than a file so that nothing has to be cleaned up on the
+    device, and the marker is unique per deploy.
     """
     return f'\n:log info "{marker}"\n'
 
 
+def import_failed(detail: str) -> str:
+    """What `deploy` says when the sentinel the script ends with was not logged.
+
+    It deliberately makes no claim about what did or did not reach the device,
+    because the tool cannot know: a script RouterOS could not parse applies
+    nothing, while one that failed partway through has already applied every
+    line above the failing one, and both leave the same evidence (no sentinel,
+    a `script,error` line). Measured on 7.15.3 with this tool: a runtime abort
+    after two `add`s left the identity set and one filter rule in place.
+
+    That is why the wording warns instead of reassuring. An operator told "the
+    device is unchanged" re-runs the corrected script, and RouterOS has no
+    reconciliation -- a repeated `add` makes a second object, so the re-run
+    duplicates whatever the first attempt managed to apply.
+    """
+    return (
+        "the import did not run to the end, so this deploy did not complete: "
+        "RouterOS exits 0 either way, and the sentinel line this tool appended "
+        "to the uploaded copy was never logged.\n"
+        "a prefix of the script may already have been applied. A script the "
+        "device cannot parse applies nothing, but one that fails while running "
+        "has applied every line before the failing one, and this tool cannot "
+        "tell the two apart. Do not re-run it on that assumption: RouterOS has "
+        "no reconciliation, so a repeated `add` makes a second object and a "
+        "re-run duplicates what the first attempt applied. Check the device "
+        "first -- `nix-mikrotik diff` shows what it holds now.\n"
+        "the device's most recent script errors (its log holds earlier failures "
+        f"too, so read these as context):\n{detail}")
+
+
 def check_applied(router: Router, marker: str, output: str) -> None:
-    """Refuse to call a deploy successful when the device applied nothing.
+    """Refuse to call a deploy successful when the script did not run to the end.
 
     `/import` answers a script it cannot parse by logging the error and exiting
     **0**, so ssh's status says "fine" whether the configuration applied or the
@@ -349,7 +385,8 @@ def check_applied(router: Router, marker: str, output: str) -> None:
     produced an empty stdout, an unchanged identity and rc=0). The positive
     signal is the sentinel line: a clean run logs it and prints "…executed
     successfully"; a parse error produces neither, and a runtime error stops
-    before the sentinel does.
+    before the sentinel does. Which of the two happened is not recoverable
+    here, so the failure says so rather than guessing -- see `import_failed`.
     """
     if IMPORT_OK_TEXT in output:
         return
@@ -359,14 +396,7 @@ def check_applied(router: Router, marker: str, output: str) -> None:
         time.sleep(1)
     errors = router.script_errors()[-5:]
     detail = "\n".join(errors) if errors else "(no script error in the device log)"
-    raise ToolError(
-        "the import did not run to the end, so the device kept its previous "
-        "configuration: RouterOS aborts a whole script on a value or a line it "
-        "cannot parse, and exits 0 either way -- the sentinel line this tool "
-        "appended was never logged, so no line of the script can be assumed to "
-        "have run.\n"
-        "the device's most recent script errors (its log holds earlier failures "
-        f"too, so read these as context):\n{detail}")
+    raise ToolError(import_failed(detail))
 
 
 def cmd_deploy(args: argparse.Namespace) -> int:

@@ -1,8 +1,11 @@
-{ pkgs, nix-mikrotik }:
+{ pkgs, nix-mikrotik, cliSource }:
 
 # The deploy tool's contract, minus the device: placeholders are enumerated,
 # substituted from files, and an unresolved one is a hard failure rather than a
-# script with a literal __MIKROTIK_SECRET_… in it.
+# script with a literal __MIKROTIK_SECRET_… in it. What a *failure* is allowed
+# to claim is part of that contract too, and is asserted here against the
+# function `deploy` calls (`cliSource` is the same file the package installs,
+# so the message is tested once, not copied into a fixture).
 #
 # What a substituted value is *spelled* like is part of that contract, not
 # cosmetics. RouterOS ends the command early on an unquoted value containing
@@ -110,6 +113,34 @@ pkgs.runCommand "check-cli" { } ''
   fi
   grep -q 'not usable as a file name' err-trav
   ! test -e trav.out.rsc
+
+  # ------------------------------------------------ what a failure claims ----
+  # A failed import cannot be told apart from a partial one: a parse abort
+  # applies nothing, a runtime abort has applied a prefix. So the message must
+  # not tell the operator the device is unchanged -- that invites a re-run, and
+  # RouterOS has no reconciliation, so a repeated `add` makes a second object
+  # (measured on 7.15.3: identity set and one filter rule applied, then a
+  # duplicate after the invited re-deploy). Asserted against the function the
+  # tool actually calls, so a rewording that drifts back fails here.
+  ${pkgs.python3}/bin/python3 - ${cliSource} <<'PY'
+  import importlib.util
+  import sys
+  from importlib.machinery import SourceFileLoader
+
+  spec = importlib.util.spec_from_loader(
+      "nix_mikrotik", SourceFileLoader("nix_mikrotik", sys.argv[1]))
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+
+  message = module.import_failed(
+      "script,error script error: value of range must have ip address before '/'")
+  lowered = message.lower()
+  assert "kept its previous configuration" not in lowered, message
+  assert "may already have been applied" in lowered, message
+  assert "prefix" in lowered, message
+  assert "re-run" in lowered, message
+  print("failed-import message claims a possible prefix and warns against a blind re-run")
+  PY
 
   touch $out
 ''

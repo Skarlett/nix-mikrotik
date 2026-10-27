@@ -97,10 +97,11 @@
 
             # The CLI's secret handling: placeholders listed, substituted with
             # the quoting RouterOS needs, and refused when a value or a name is
-            # unusable.
+            # unusable -- plus the claim its failure message is allowed to make.
             cli = import ./tests/cli.nix {
               inherit pkgs;
               nix-mikrotik = config.packages.nix-mikrotik;
+              cliSource = ./pkgs/nix_mikrotik.py;
             };
 
             # The class refuses what it says it refuses, with a diagnostic that

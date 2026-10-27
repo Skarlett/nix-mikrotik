@@ -107,10 +107,13 @@ the way it is onto a NixOS host. It is **delivered** instead:
    before it goes into the line: an unquoted base64 key — every WireGuard
    private key — makes the device end the command early, abort the whole script
    and still exit 0;
-7. a script the device refused to parse is therefore a **failure, not a silent
+7. a script the device did not finish running is a **failure, not a silent
    no-op**: `deploy` appends a one-line sentinel to the uploaded copy and reads
    the device's log back, so it cannot print `verified` for an import that
-   applied nothing.
+   stopped early. What stopped it is not recoverable — a parse abort applies
+   nothing, a runtime abort has already applied a prefix — so the failure says
+   exactly that rather than claiming the device is unchanged, and warns that a
+   re-run can duplicate what the first attempt managed to apply.
 
 ```sh
 nix-mikrotik deploy router.rsc --host 10.0.0.1 \
@@ -184,9 +187,14 @@ nix-mikrotik diff router.rsc --host 10.0.0.1
 * `deploy` **imports** by default, which merges into the running
   configuration. RouterOS has no reconciliation — a repeated `add` makes a
   second object — so importing the same script twice is not idempotent.
-* a refused import is a failure, not a silent no-op: RouterOS logs a parse error
-  and still exits 0, so `deploy` appends a sentinel line to the uploaded copy and
-  reads the device's log back before it reports success.
+* an import that did not run to the end is a failure, not a silent no-op:
+  RouterOS logs a parse error and still exits 0, so `deploy` appends a sentinel
+  line to the uploaded copy and reads the device's log back before it reports
+  success. When the sentinel never appears it exits 2 and says **a prefix of the
+  script may have been applied** — the tool cannot tell a parse abort (nothing
+  applied) from a runtime one (everything above the failing line applied).
+  Check the device (`nix-mikrotik diff`) before re-deploying: a repeated `add`
+  makes a second object.
 * `deploy --reset --yes` runs `/system reset-configuration
   no-defaults=yes run-after-reset=…` instead: the device reboots into exactly
   the script. That is the declarative path, and it wipes the configuration.
