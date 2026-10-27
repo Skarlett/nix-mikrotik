@@ -63,6 +63,36 @@ rec {
   # Evaluate and render in one step. `config` is what `evalMikrotik` returns.
   renderConfig = config: renderer.render config;
 
+  # The fleet form: every router declared under `mikrotik.routers`, rendered.
+  #
+  # The single-router options are not rendered here -- a configuration that
+  # fills them in as well is refused by an assertion rather than silently
+  # producing a script the fleet does not name.
+  evalMikrotikFleet =
+    { modules
+    , specialArgs ? { }
+    }:
+    let
+      cfg = (evalMikrotik { inherit modules specialArgs; }).mikrotik;
+    in
+    lib.mapAttrs (_name: router: renderer.render { mikrotik = router; }) cfg.routers;
+
+  # The fleet as derivations, one directory per router: `$out/<name>/router-config.rsc`.
+  mkRouterFleetScripts =
+    { pkgs
+    , config
+    }:
+    pkgs.runCommandLocal "mikrotik-fleet-scripts" { } (
+      lib.concatStringsSep "\n" (
+        lib.mapAttrsToList
+          (name: router: ''
+            mkdir -p $out/${name}
+            cp ${pkgs.writeText "${name}-config.rsc" (renderer.render { mikrotik = router; })} $out/${name}/router-config.rsc
+          '')
+          config.mikrotik.routers
+      )
+    );
+
   # A derivation holding router-config.rsc, so a build of the router's
   # configuration is a store path like any other.
   mkRouterScript =

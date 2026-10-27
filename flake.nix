@@ -116,6 +116,14 @@
               inherit pkgs;
               imageFile = chr.imageFile;
             };
+
+            # Several routers in one configuration: they compose instead of
+            # colliding, each script keeps its own identity, and a refusal names
+            # the router that is wrong.
+            fleet = import ./tests/fleet.nix {
+              inherit pkgs;
+              inherit (mt) evalMikrotik evalMikrotikFleet evalMikrotikRaw mkSecret;
+            };
           };
 
           devShells.default = pkgs.mkShell {
