@@ -229,6 +229,57 @@ Two things about CHR that cost time if you do not know them:
 `checks.chr-smoke` boots the pinned image and waits for the RouterOS login
 prompt, so a broken image pin fails the build rather than a lab session.
 
+`checks.chr-deploy` goes further: it boots that image, applies a rendered
+configuration to the device, and reads the device's state back. It is the only
+check that can answer whether RouterOS *accepts* what the renderer produced —
+`/import` exits 0 for a script the device refused to parse, so nothing about the
+build itself can. What it asserts, all read over REST afterwards:
+
+* the identity, a bridge with an address on it, and a dhcp-server drawing from a
+  pool created earlier in the same script (section order is real);
+* a firewall comment carrying `$`, and a *secret* substituted into a dns
+  comment, both read back byte for byte;
+* the interface whose line carries the substituted WireGuard key — it exists at
+  all only if the whole script ran, because unquoted that base64 `=` padding
+  makes the device refuse the script from its first line;
+* the uploaded copy is gone from the device afterwards;
+* and, the other way round, that a deliberately broken script **fails** the
+  deploy, with the device's own `script error: expected end of command` in the
+  log and nothing applied. A check whose subject always applies cannot be shown
+  to fail, so the refusal is part of the check rather than a claim about it.
+
+`tests/chr-deploy.py` is the whole of it and needs nothing from nix, so it also
+runs against a CHR from the lab above — which is how its assertions were written:
+
+```sh
+nix run .#chr-lab -- start
+script=$(nix build --no-link --print-out-paths .#mikrotik-chr-fixture-script)
+cli=$(nix build --no-link --print-out-paths .#nix-mikrotik)
+tests/chr-deploy.py --host 127.0.0.1 --ssh-port 2201 --rest-port 8081 \
+  --script "$script/router-config.rsc" --expect-hostname chr-deploy \
+  --secret 'wg-private-key=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=' \
+  --secret 'dns-comment=a"b\c$d' \
+  --broken-script tests/fixtures/refused.rsc --cli "$cli/bin/nix-mikrotik"
+```
+
+It bootstraps its own ssh access rather than needing a console: it serves a
+fresh public key to the guest at `http://10.0.2.2:<port>/` and has the device
+import it over REST (`POST /tool/fetch`, then `POST /user/ssh-keys/import`),
+then removes it again. The `--secret` values are obviously fake, and the fixture
+is the only configuration here that a CHR can actually hold — the examples name
+`ether2` … `sfp1` (see "Not done yet").
+
+Two lab notes this leaves behind: a CHR rebuilt at a host:port you have already
+deployed to comes back with a **new ssh host key**, and the deploy tool's
+`accept-new` then refuses it (OpenSSH reads `known_hosts` from the password
+database, not from `$HOME`, so nothing redirects it) — clear it with
+`ssh-keygen -R '[127.0.0.1]:2201'`, or use a port you have not deployed to.
+Inside the nixos test that cannot arise. And RouterOS logs `script,error
+executing script from sshd failed` for *any* command a client runs over ssh that
+exits non-zero — including the deploy's own `/file remove`, which is retried
+because it races the import — so that line is not evidence about a script; the
+device's `script error: …` line is.
+
 ## Layout
 
 ```
@@ -237,7 +288,9 @@ modules/        base.nix (the class), hardening.nix (composable defaults)
 pkgs/           the nix-mikrotik CLI
 chr/            pinned CHR images and the two-VM lab
 examples/       module-configuration.nix, plus upstream's untouched example
-tests/          render (two goldens), cli, eval, chr-smoke
+tests/          render (two goldens), cli, eval, chr-smoke, chr-deploy
+                (+ fixtures/: the configuration a CHR is given, and a script it
+                must refuse)
 ```
 
 ## Differences from upstream
@@ -261,3 +314,13 @@ tests/          render (two goldens), cli, eval, chr-smoke
   convergent mode, and it is destructive.
 * **`/export`-based import of existing routers**: the migration path is still
   "read the export, write the module by hand".
+* **the examples on a CHR**: both describe a router with `ether2` … `ether5` and
+  `sfp1`, and a CHR has one ethernet port, so an `/ip address … interface=ether2`
+  line is refused at runtime (`script error: input does not match any value of
+  interface`, measured on 7.15.3 — with the identity, both bridges and the vlan
+  above it already applied). They are upstream's router, ported, and stay as
+  they are; `checks.chr-deploy` applies `tests/fixtures/chr-configuration.nix`,
+  which is written for a CHR.
+* **the deploy tool's ssh trust**: `deploy`/`diff` accept `--host`, `--port` and
+  `--key`, but not a known-hosts file, so a rebuilt lab device is refused at the
+  same `host:port` until the stale key is removed by hand (`ssh-keygen -R`).

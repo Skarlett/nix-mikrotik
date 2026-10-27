@@ -29,6 +29,13 @@
       evaluated = lib.mapAttrs
         (_: modules: mt.evalMikrotik { inherit modules; })
         exampleModules;
+
+      # The configuration `checks.chr-deploy` applies to a real RouterOS.
+      # Written for a CHR -- one ethernet port, no wireless -- rather than
+      # reusing an example, which describes upstream's router (ether2 … sfp1).
+      chrFixture = mt.evalMikrotik {
+        modules = [ ./tests/fixtures/chr-configuration.nix ];
+      };
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" ];
@@ -67,6 +74,13 @@
             chr-lab = chr.lab;
             mikrotik-chr = chr.image;
             mikrotik-option = chr.optionPackage;
+            # `checks.chr-deploy` applies this one to a CHR; it is a package so
+            # that the same script can be deployed by hand to a lab device.
+            mikrotik-chr-fixture-script = mt.mkRouterScript {
+              inherit pkgs;
+              name = "chr-fixture";
+              config = chrFixture;
+            };
             default = chr.lab;
           };
 
@@ -115,6 +129,21 @@
             chr-smoke = import ./tests/chr-smoke.nix {
               inherit pkgs;
               imageFile = chr.imageFile;
+            };
+
+            # Apply a rendered configuration to that CHR and read the device
+            # back: the renderer's output has to be something RouterOS accepts
+            # and ends up holding, which no pure check can see.
+            chr-deploy = import ./tests/chr-deploy.nix {
+              inherit lib pkgs;
+              inherit (chr) imageFile;
+              nix-mikrotik = config.packages.nix-mikrotik;
+              harness = pkgs.runCommandLocal "chr-deploy-check" { } ''
+                install -Dm755 ${./tests/chr-deploy.py} $out/bin/chr-deploy-check
+                patchShebangs $out/bin
+              '';
+              script = config.packages.mikrotik-chr-fixture-script;
+              refusedScript = ./tests/fixtures/refused.rsc;
             };
           };
 
