@@ -25,6 +25,11 @@ pkgs.runCommand "check-render" { } ''
   grep -q 'disabled=no' $out/module.rsc
   ! grep -q 'disabled=false' $out/module.rsc
 
+  # A value RouterOS cannot parse unquoted is quoted; one it can, is not.
+  # `public-key=<base64>=` broke an import at "expected end of command".
+  grep -q 'public-key="l0VH8y3T0nKzZ9Qq2m4Xo8b1y6wR5cJ7dE3fG9hI2kA="' $out/module.rsc
+  grep -q 'address=10.10.10.1/24' $out/module.rsc
+
   # The hardening module composed with the example rather than replacing it.
   grep -q '^/tool mac-server ping' $out/module.rsc
   grep -q 'allowed-interface-list=none' $out/module.rsc

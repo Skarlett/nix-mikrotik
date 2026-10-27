@@ -36,6 +36,15 @@ let
   escapeQuotes = s: builtins.replaceStrings [ "\\" "\"" ] [ "\\\\" "\\\"" ] s;
   quoted = v: "\"${escapeQuotes (scalar v)}\"";
 
+  # RouterOS parses `key=value` with its own grammar and a value that contains
+  # a space, `=`, `;`, a quote, a backslash or a `$` ends the command early:
+  #   add ... public-key=l0VH8y3T0nKz...hkA=
+  #   script error: expected end of command (line 41 column 186)
+  # An exported configuration quotes exactly those (`public-key="…="`), so
+  # mirror it rather than quoting everything, which would change the output for
+  # values that are already fine unquoted (addresses, lists, names).
+  needsQuote = s: builtins.match ''.*[ =;"\\$].*'' s != null;
+
   formatValue = key: value:
     if isSecret value then
       (if key == null then placeholder value.__mikrotikSecret
@@ -51,6 +60,8 @@ let
       concatStringsSep " " ([ key ] ++ mapAttrsToList (k: v: formatValue k v) value)
     else if isAttrs value then
       concatStringsSep " " (mapAttrsToList (k: v: formatValue k v) value)
+    else if isString value && needsQuote value then
+      "${key}=${quoted value}"
     else
       "${key}=${scalar value}";
 
