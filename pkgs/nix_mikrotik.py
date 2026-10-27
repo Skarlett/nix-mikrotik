@@ -361,8 +361,12 @@ def check_applied(router: Router, marker: str, output: str) -> None:
     detail = "\n".join(errors) if errors else "(no script error in the device log)"
     raise ToolError(
         "the import did not run to the end, so the device kept its previous "
-        "configuration: RouterOS aborts the whole script on a value or a line "
-        f"it cannot parse, and exits 0 either way.\n{detail}")
+        "configuration: RouterOS aborts a whole script on a value or a line it "
+        "cannot parse, and exits 0 either way -- the sentinel line this tool "
+        "appended was never logged, so no line of the script can be assumed to "
+        "have run.\n"
+        "the device's most recent script errors (its log holds earlier failures "
+        f"too, so read these as context):\n{detail}")
 
 
 def cmd_deploy(args: argparse.Namespace) -> int:
