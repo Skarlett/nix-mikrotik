@@ -151,21 +151,55 @@ def read_secret_files(directory: str, names: list[str]) -> dict[str, str]:
 # transport
 # --------------------------------------------------------------------------
 
+def check_known_hosts(path: str) -> str:
+    """A known_hosts path ssh can actually record a key in, or a refusal.
+
+    `StrictHostKeyChecking=accept-new` learns a key by *appending* it to this
+    file, and that append fails quietly: ssh prints one warning -- "Failed to
+    add the host to the list of known hosts" -- to stderr and carries on, so a
+    deploy that names a path it cannot write there looks pinned and is not. The
+    case worth catching is a parent directory that does not exist (ssh creates
+    the file itself, not the directory), and it is the only thing this option
+    can be wrong about before a packet is sent.
+    """
+    expanded = os.path.expanduser(path)
+    parent = os.path.dirname(expanded) or "."
+    if not os.path.isdir(parent):
+        raise ToolError(
+            f"--known-hosts {path}: '{parent}' is not a directory, so ssh cannot "
+            "record the host key it learns there: it would warn and continue, "
+            "and the pin would be silently absent")
+    return expanded
+
+
 class Router:
     """ssh/scp against a RouterOS device.
 
     RouterOS' sshd accepts a command argument, so both halves are one-shot
     invocations of the system openssh. No library, no agent, no key handling of
     our own: whatever the operator's ssh already does for the fleet, it does
-    here.
+    here -- with one exception, `known_hosts`.
+
+    `~/.ssh/known_hosts` is a `~` ssh resolves through the *passwd* entry, not
+    through `$HOME`, so a caller with no operator home -- a systemd unit running
+    as root under `ProtectHome = true`, ccpkgs' `services.mikrotik` -- has no
+    such file and can learn nothing: under `accept-new` every deploy is then a
+    first contact, and the secretized script goes to whoever answers the
+    address. `known_hosts` names the file instead, so such a caller can hand in
+    a path it can write (a unit's `StateDirectory`) and the pin is learned
+    again. The *semantics* of `accept-new` are untouched: only the file is
+    selectable, and the machine-wide `/etc/ssh/ssh_known_hosts` that a pinned
+    host key lands in is still read.
     """
 
     def __init__(self, host: str, user: str = "admin", port: int = 22,
-                 key: str | None = None, timeout: int = 20) -> None:
+                 key: str | None = None, known_hosts: str | None = None,
+                 timeout: int = 20) -> None:
         self.host = host
         self.user = user
         self.port = port
         self.key = key
+        self.known_hosts = check_known_hosts(known_hosts) if known_hosts else None
         self.timeout = timeout
 
     def _common(self) -> list[str]:
@@ -176,6 +210,10 @@ class Router:
         ]
         if self.key:
             args += ["-i", os.path.expanduser(self.key)]
+        if self.known_hosts:
+            # `-o` rather than a config file: it applies to this invocation
+            # only, which is what a tool that shells out twice per deploy wants.
+            args += ["-o", f"UserKnownHostsFile={self.known_hosts}"]
         return args
 
     def run(self, command: str) -> str:
@@ -400,12 +438,27 @@ def check_applied(router: Router, marker: str, output: str) -> None:
 
 
 def cmd_deploy(args: argparse.Namespace) -> int:
-    router = Router(args.host, args.user, args.port, args.key)
+    # The confirmation comes first, before anything that reaches the device or
+    # reads a secret value: `--reset` without `--yes` is a refused invocation,
+    # and it used to be refused only after `router.upload()` had put the
+    # secretized script -- plaintext secrets, on the device's flash -- and after
+    # `_secretize` had read every secret into memory. The `finally` below does
+    # remove it again, so nothing leaked; but the refusal was not the guard it
+    # reads as, and it has no business doing work it is about to undo.
+    if args.reset and not args.yes:
+        raise ToolError(
+            "--reset wipes the device's configuration and reboots it; "
+            "pass --yes to confirm")
+
+    router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
     text, names = _secretize(args.script, args.secret, args.secrets_dir)
 
     if args.dry_run:
         print(f"would deploy {len(text)} bytes with {len(names)} secret(s) to "
               f"{args.user}@{args.host}:{args.port}")
+        if args.reset:
+            print("would reset the configuration with the uploaded script "
+                  "(destructive)", file=sys.stderr)
         return 0
 
     workdir = tempfile.mkdtemp(prefix="nix-mikrotik-")
@@ -423,11 +476,8 @@ def cmd_deploy(args: argparse.Namespace) -> int:
 
         if args.reset:
             # The declarative path: the device reboots with the script applied
-            # to an empty configuration. Destructive by definition.
-            if not args.yes:
-                raise ToolError(
-                    "--reset wipes the device's configuration and reboots it; "
-                    "pass --yes to confirm")
+            # to an empty configuration. Destructive by definition, and confirmed
+            # above.
             print("resetting configuration from the uploaded script",
                   file=sys.stderr)
             router.run(
@@ -483,7 +533,7 @@ def _normalise(text: str) -> list[str]:
 def cmd_diff(args: argparse.Namespace) -> int:
     import difflib
 
-    router = Router(args.host, args.user, args.port, args.key)
+    router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
     live = _normalise(router.export())
     with open(args.script, "r", encoding="utf-8") as handle:
         wanted = _normalise(handle.read())
@@ -530,6 +580,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user", default="admin")
     p.add_argument("--port", type=int, default=22)
     p.add_argument("--key", help="ssh private key")
+    p.add_argument("--known-hosts", metavar="PATH",
+                   help="known_hosts file ssh records host keys in (default: "
+                        "the operator's ~/.ssh/known_hosts; a unit with no home "
+                        "needs this, or every deploy is a first contact)")
     p.add_argument("--secret", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--secrets-dir")
     p.add_argument("--reset", action="store_true",
@@ -549,6 +603,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user", default="admin")
     p.add_argument("--port", type=int, default=22)
     p.add_argument("--key")
+    p.add_argument("--known-hosts", metavar="PATH",
+                   help="known_hosts file ssh records host keys in (default: "
+                        "the operator's ~/.ssh/known_hosts)")
     p.set_defaults(func=cmd_diff)
 
     return parser

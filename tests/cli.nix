@@ -13,6 +13,13 @@
 # is exactly that shape: the device then aborts the *entire* script, applies
 # nothing, and `/import` still exits 0. A fixture value like `sekret-key` cannot
 # see that, which is why one of the cases below is base64-shaped.
+#
+# Two decisions the tool makes before it opens a socket are tested the same way,
+# on the module rather than on a device: that `--reset` without `--yes` is
+# refused *before* it uploads anything, and that the ssh/scp argv a caller gets
+# is one it can point at a known_hosts file it owns. Both were defects that a
+# device-side test could not have caught cheaply -- one needed a refused deploy
+# to reach the wire to be visible, the other needed a unit with no home.
 pkgs.runCommand "check-cli" { } ''
   set -eu
   work=$(mktemp -d)
@@ -114,6 +121,16 @@ pkgs.runCommand "check-cli" { } ''
   grep -q 'not usable as a file name' err-trav
   ! test -e trav.out.rsc
 
+  # ------------------------------------------------ where ssh may write -------
+  # `--known-hosts` is what lets a caller with no operator home -- a unit
+  # running as root under `ProtectHome`, where ssh's `~` (which it resolves
+  # through the passwd entry, not `$HOME`) is nowhere ssh can write -- say where
+  # a host key may be recorded, so that `accept-new` pins rather than starting
+  # from nothing on every deploy. Offered by both subcommands that speak ssh;
+  # the argv it produces is asserted below, against the module.
+  $cli deploy --help | grep -q -- '--known-hosts'
+  $cli diff --help | grep -q -- '--known-hosts'
+
   # ------------------------------------------------ what a failure claims ----
   # A failed import cannot be told apart from a partial one: a parse abort
   # applies nothing, a runtime abort has applied a prefix. So the message must
@@ -122,9 +139,17 @@ pkgs.runCommand "check-cli" { } ''
   # (measured on 7.15.3: identity set and one filter rule applied, then a
   # duplicate after the invited re-deploy). Asserted against the function the
   # tool actually calls, so a rewording that drifts back fails here.
+  #
+  # The two sections below it are the same shape: the deploy guard and the
+  # transport's argv, asserted on the module rather than on a device, because
+  # both are decisions the tool makes before it opens a socket.
   ${pkgs.python3}/bin/python3 - ${cliSource} <<'PY'
+  import contextlib
   import importlib.util
+  import io
+  import os
   import sys
+  import tempfile
   from importlib.machinery import SourceFileLoader
 
   spec = importlib.util.spec_from_loader(
@@ -140,6 +165,102 @@ pkgs.runCommand "check-cli" { } ''
   assert "prefix" in lowered, message
   assert "re-run" in lowered, message
   print("failed-import message claims a possible prefix and warns against a blind re-run")
+
+  # ------------------------------------------- where ssh records a host key ----
+  # The transport builds its own ssh/scp argv, so the selectable known_hosts is
+  # asserted on the argv: a caller that has no operator home can name the file,
+  # and the *semantics* of accept-new are untouched (the file changes, nothing
+  # else does).
+  work = tempfile.mkdtemp()
+  known_hosts = os.path.join(work, "known_hosts")
+  talk = []
+
+  def recording_run(argv, *args, **kwargs):
+      talk.append(list(argv))
+      return module.subprocess.CompletedProcess(argv, 0, "", "")
+
+  module.subprocess.run = recording_run
+
+  router = module.Router("192.0.2.1", known_hosts=known_hosts)
+  router.run("/system identity print")
+  router.upload(os.path.join(work, "router-config.rsc"))
+  assert len(talk) == 2, talk
+  for argv in talk:
+      assert f"UserKnownHostsFile={known_hosts}" in argv, argv
+      assert "StrictHostKeyChecking=accept-new" in argv, argv
+      assert "BatchMode=yes" in argv, argv
+      assert argv.index("-o") < argv.index(f"UserKnownHostsFile={known_hosts}"), argv
+
+  # Omitting it changes nothing: no option, so the operator's ssh behaves
+  # exactly as it did before this flag existed.
+  default = module.Router("192.0.2.1")._common()
+  assert not any("UserKnownHostsFile" in arg for arg in default), default
+
+  # A path ssh could not write is refused up front. ssh treats a failed append
+  # as a warning, so the alternative is a deploy that looks pinned and is not.
+  try:
+      module.Router("192.0.2.1", known_hosts="/nonexistent-dir/known_hosts")
+  except module.ToolError as exc:
+      assert "not a directory" in str(exc), str(exc)
+  else:
+      raise AssertionError("Router accepted a known_hosts path ssh cannot write")
+
+  # Both subcommands that speak ssh take it, and it reaches the Router.
+  parser = module.build_parser()
+  for command in ("deploy", "diff"):
+      ns = parser.parse_args(
+          [command, "router.rsc", "--host", "192.0.2.1", "--known-hosts", known_hosts])
+      assert ns.known_hosts == known_hosts, ns
+  assert parser.parse_args(["deploy", "router.rsc", "--host", "192.0.2.1"]).known_hosts is None
+  print("known_hosts is selectable on the argv, and accept-new is unchanged")
+
+  # ---------------------------------------- what a refusal is allowed to do ----
+  # `deploy --reset` without `--yes` must be refused *before* the secretized
+  # script is uploaded: it used to be refused only after `Router.upload()` had
+  # put it on the device, so the confirmation was doing nothing of what it read
+  # as. Both halves are asserted here -- that the refusal reaches no transport,
+  # and that `--yes` is what changes that.
+  script = os.path.join(work, "router.rsc")
+  with open(script, "w") as handle:
+      handle.write("/interface wireguard\n"
+                   "set name=wg.luninet private-key=__MIKROTIK_SECRET_wg-private-key__\n")
+  with open(os.path.join(work, "wg-private-key"), "w") as handle:
+      handle.write("QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=")
+
+  talk.clear()
+  err = io.StringIO()
+  with contextlib.redirect_stderr(err):
+      rc = module.main(["deploy", script, "--host", "192.0.2.1", "--reset",
+                        "--secrets-dir", work])
+  assert rc == 2, rc
+  assert "pass --yes" in err.getvalue(), err.getvalue()
+  assert talk == [], f"a refused --reset deploy reached the transport: {talk}"
+
+  # ... and it is refused before the secrets are read, too: with no value
+  # supplied at all the message is still the confirmation, not "unresolved".
+  err = io.StringIO()
+  with contextlib.redirect_stderr(err):
+      rc = module.main(["deploy", script, "--host", "192.0.2.1", "--reset"])
+  assert rc == 2, rc
+  assert "pass --yes" in err.getvalue(), err.getvalue()
+  assert "unresolved" not in err.getvalue(), err.getvalue()
+
+  # The control: confirmed, it does reach the transport. `upload` is where the
+  # secretized script would leave the machine, so that is where this stops.
+  uploaded = []
+
+  def record_upload(self, local):
+      uploaded.append(local)
+      raise module.ToolError("stopped at upload for the test")
+
+  module.Router.upload = record_upload
+  err = io.StringIO()
+  with contextlib.redirect_stderr(err):
+      rc = module.main(["deploy", script, "--host", "192.0.2.1", "--reset",
+                        "--yes", "--secrets-dir", work])
+  assert rc == 2 and "stopped at upload" in err.getvalue(), err.getvalue()
+  assert uploaded, "a confirmed --reset deploy never reached the upload"
+  print("--reset is refused before upload without --yes, and passes the guard with it")
   PY
 
   touch $out

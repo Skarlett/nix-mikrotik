@@ -184,6 +184,21 @@ nix-mikrotik diff router.rsc --host 10.0.0.1
 
 * Transport is the system `ssh`/`scp`: key-based auth against the router's
   `admin` user, no library, no password handling of our own.
+* `--known-hosts PATH` is the one thing the transport will not take from the
+  operator's environment. `accept-new` learns a host key by appending it to
+  ssh's known_hosts file, and that `~` comes from the passwd entry rather than
+  `$HOME` — so a caller with no operator home (a systemd unit as root under
+  `ProtectHome = true`) has nowhere to record one and every deploy is a first
+  contact. Pass a path the caller *can* write (ccpkgs' `services.mikrotik` hands
+  the unit a `StateDirectory`-backed file) and the pin is learned again. A path
+  whose directory does not exist is refused: ssh treats a failed append as a
+  warning, so the alternative is a deploy that looks pinned and is not. Only the
+  file is selectable — `accept-new` still means accept-new, and a key pinned
+  machine-wide in `/etc/ssh/ssh_known_hosts` is still read.
+* `deploy --reset` **without** `--yes` is refused before anything happens:
+  before the transport, and before a secret value is read. It used to be refused
+  after the secretized script had already been uploaded, which made the
+  confirmation not the guard it reads as.
 * `deploy` **imports** by default, which merges into the running
   configuration. RouterOS has no reconciliation — a repeated `add` makes a
   second object — so importing the same script twice is not idempotent.
