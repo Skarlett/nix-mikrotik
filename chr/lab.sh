@@ -4,6 +4,7 @@
 #   chr-lab start     create overlays and start both VMs
 #   chr-lab stop      stop both
 #   chr-lab status    show pids and the management ports
+#   chr-lab fresh     drop the overlays (licence and configuration go with them)
 #
 # CHR_IMAGE is set by the wrapper to the pinned image in the store.
 set -euo pipefail
@@ -12,7 +13,7 @@ STATE="${CHR_LAB_STATE:-$PWD/chr-lab}"
 IMAGE="${CHR_IMAGE:?CHR_IMAGE is not set; run this through the flake app}"
 
 start_vm() {
-  local name="$1" lport="$2" rport="$3" mac1="$4" mac2="$5" ssh="$6" www="$7"
+  local name="$1" link="$2" mac1="$3" mac2="$4" ssh="$5" www="$6"
 
   if [[ -f "$STATE/$name.pid" ]] && kill -0 "$(cat "$STATE/$name.pid")" 2>/dev/null; then
     echo "$name already running (pid $(cat "$STATE/$name.pid"))"
@@ -20,17 +21,19 @@ start_vm() {
   fi
 
   # An existing overlay holds the device's licence and configuration; only
-  # create one when there is none. `fresh` wipes both.
+  # create one when there is none. `chr-lab fresh` wipes both.
   if [[ ! -f "$STATE/$name.qcow2" ]]; then
     qemu-img create -q -f qcow2 -F qcow2 -b "$IMAGE" "$STATE/$name.qcow2"
   fi
 
+  # The inter-router link is the tcp socket backend: no tap, so no
+  # CAP_NET_ADMIN, and flow control that the UDP (dgram) backend lacks.
   qemu-system-x86_64 \
     -name "$name" \
     -machine q35,accel=kvm:tcg \
     -cpu max -smp 2 -m 1024 \
     -drive "file=$STATE/$name.qcow2,if=virtio,format=qcow2" \
-    -netdev "socket,id=link0,listen=127.0.0.1:$lport" \
+    -netdev "$link" \
     -device "virtio-net-pci,netdev=link0,mac=$mac1,host_mtu=9000" \
     -netdev "user,id=mgmt,hostfwd=tcp:127.0.0.1:$ssh-:22,hostfwd=tcp:127.0.0.1:$www-:80" \
     -device "virtio-net-pci,netdev=mgmt,mac=$mac2" \
@@ -55,10 +58,13 @@ stop_vm() {
 case "${1:-start}" in
   start)
     mkdir -p "$STATE"
-    # chr-a listens, so it must be up before chr-b connects.
-    start_vm chr-a 15501 15502 52:54:00:00:0a:01 52:54:00:00:0b:01 2201 8081
+    # One end listens, the other connects: two listeners are two unconnected
+    # links. chr-a has to be up first.
+    start_vm chr-a "socket,id=link0,listen=127.0.0.1:15501" \
+      52:54:00:00:0a:01 52:54:00:00:0b:01 2201 8081
     sleep 2
-    start_vm chr-b 15502 15501 52:54:00:00:0a:02 52:54:00:00:0b:02 2202 8082
+    start_vm chr-b "socket,id=link0,connect=127.0.0.1:15501" \
+      52:54:00:00:0a:02 52:54:00:00:0b:02 2202 8082
     cat <<'EOF'
 
 Both routers boot unlicensed: CHR's free tier caps throughput at 1 Mbit/s.
