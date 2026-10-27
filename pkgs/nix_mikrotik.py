@@ -130,12 +130,23 @@ class Router:
 
     def remove(self, remote: str) -> None:
         # Best effort: the uploaded script carries plaintext secrets and must
-        # not stay on the device's flash.
-        try:
-            self.run(f'/file remove [find where name="{remote}"]')
-        except ToolError as exc:  # pragma: no cover - reported, not fatal
-            print(f"warning: could not remove {remote} from the device: {exc}",
-                  file=sys.stderr)
+        # not stay on the device's flash. `/file remove <name>` rather than
+        # `/file remove [find …]`: the find expression needs RouterOS' own
+        # bracket syntax to survive the remote shell, and a name is a name.
+        #
+        # Retried, because it runs immediately after /import and the device is
+        # often still applying the script: the first attempt fails with a bare
+        # exit 1 and the same command succeeds a second later.
+        last: ToolError | None = None
+        for _attempt in range(5):
+            try:
+                self.run(f'/file remove "{remote}"')
+                return
+            except ToolError as exc:
+                last = exc
+                time.sleep(1)
+        print(f"warning: could not remove {remote} from the device: {last}",
+              file=sys.stderr)
 
     def identity(self) -> str | None:
         out = self.run("/system identity print")
