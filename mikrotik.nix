@@ -1,44 +1,32 @@
+# Upstream's entry point, kept working.
+#
+#   nix-build mikrotik.nix
+#   nix-build mikrotik.nix --arg mikrotik-config ./my-config.nix
+#
+# It now renders through the same code as everything else, so a configuration
+# built this way and one built through the flake cannot disagree. A bare
+# attribute set (upstream's format) is lifted into the module class: the
+# identity comes out of the set, the rest is `mikrotik.sections`.
 { mikrotik-config ? ./examples/configuration.nix }:
-with import <nixpkgs> { };
-with lib;
-with builtins;
 
 let
-  rtr = (import mikrotik-config);
+  pkgs = import <nixpkgs> { };
+  inherit (pkgs) lib;
 
-  formatValue = key: value:
-    if key == "comment" then
-      ''${key}="${value}"''
-    else if key == "no_label" then
-      formatValue null value
-      #''${key}="${value}"''
-    else if isAttrs value && key != null then
-      concatStringsSep " " (["${key}"] ++ (mapAttrsToList (k: v: formatValue k v) value))
+  mt = import ./lib { inherit lib; };
 
-    else if isAttrs value then
-      concatStringsSep " " (mapAttrsToList (k: v: formatValue k v) value)
-
-    else
-      "${key}=${value}";
-
-  formatSection = name: opts:
-    [ "${name}" ] ++ (if isAttrs opts then
-      (mapAttrsToList (k: v: "set ${formatValue k v}") opts)
-    else
-      (map (x: "add ${formatValue null x}") opts));
-
-in rec {
-  mikrotik-router = stdenv.mkDerivation rec {
-    version = "0.0.1";
-    name = "mikrotik-router-${version}";
-
-    src = builtins.toFile "router-config.rsc" (concatStringsSep "\n"
-      (flatten (mapAttrsToList (key: values: formatSection key values) rtr)));
-
-    builder = builtins.toFile "builder.sh" ''
-      source $stdenv/setup
-      mkdir $out
-      install $src $out/router-config.rsc
-    '';
+  raw = import mikrotik-config;
+  hostname = raw."/system identity".name or "MikroTik";
+  config = mt.evalMikrotik {
+    modules = [
+      {
+        mikrotik.hostname = hostname;
+        mikrotik.sections = builtins.removeAttrs raw [ "/system identity" ];
+      }
+    ];
   };
-}
+in
+pkgs.runCommand "mikrotik-router-0.0.1" { } ''
+  mkdir -p $out
+  cp ${pkgs.writeText "router-config.rsc" (mt.render config)} $out/router-config.rsc
+''
