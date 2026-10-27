@@ -17,6 +17,28 @@ rec {
   # the deploy tool on the machine that holds the secret.
   mkSecret = name: { __mikrotikSecret = name; };
 
+  # modules: modules of class "mikrotik"; the evaluated config together with the
+  # assertions it failed, without deciding what to do about them.
+  #
+  # `evalMikrotik` throws on those, and a `throw`'s text cannot be read back
+  # through `builtins.tryEval` -- so a test that checks the *diagnostic* rather
+  # than only that something was refused asks here.
+  evalMikrotikRaw =
+    { modules
+    , specialArgs ? { }
+    }:
+    let
+      result = lib.evalModules {
+        class = "mikrotik";
+        modules = [ ../modules/base.nix ] ++ modules;
+        specialArgs = { inherit mkSecret; } // specialArgs;
+      };
+    in
+    {
+      config = result.config;
+      failed = builtins.filter (a: !a.assertion) result.config.assertions;
+    };
+
   # modules: modules of class "mikrotik"; base.nix is always included.
   #
   # The assertions are forced here rather than left in the config, because a
@@ -28,19 +50,14 @@ rec {
     , specialArgs ? { }
     }:
     let
-      result = lib.evalModules {
-        class = "mikrotik";
-        modules = [ ../modules/base.nix ] ++ modules;
-        specialArgs = { inherit mkSecret; } // specialArgs;
-      };
-      failed = builtins.filter (a: !a.assertion) result.config.assertions;
+      plan = evalMikrotikRaw { inherit modules specialArgs; };
     in
-    if failed == [ ] then
-      result.config
+    if plan.failed == [ ] then
+      plan.config
     else
       throw ''
         nix-mikrotik: this configuration does not evaluate:
-        ${lib.concatMapStrings (a: "\n  - ${a.message}\n") failed}
+        ${lib.concatMapStrings (a: "\n  - ${a.message}\n") plan.failed}
       '';
 
   # Evaluate and render in one step. `config` is what `evalMikrotik` returns.

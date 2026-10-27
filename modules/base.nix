@@ -28,6 +28,18 @@ let
   referenced = lib.unique (lib.concatMap secretRefs (lib.attrValues cfg.sections));
   undeclared = builtins.filter (n: !(cfg.secrets ? ${n})) referenced;
   badPaths = builtins.filter (n: !(lib.hasPrefix "/" n)) (builtins.attrNames cfg.sections);
+
+  # A secret name is also a file name in a secrets directory (README "Clan
+  # vars": the generator's file names are the mkSecret names), so it has to be
+  # one. The deploy tool refuses anything else, and the *silent* half of that
+  # failure is the worse one: a name the tool's pattern cannot see would be
+  # listed as "no secret placeholders" and deployed as a literal
+  # __MIKROTIK_SECRET_… to a router, while a name carrying `/` or `..` would
+  # turn `--secrets-dir` into a read outside that directory.
+  secretNameRe = "^[A-Za-z0-9][A-Za-z0-9._-]*$";
+  badSecretNames = builtins.filter
+    (n: builtins.match secretNameRe n == null)
+    (lib.unique (referenced ++ builtins.attrNames cfg.secrets));
 in
 {
   _class = "mikrotik";
@@ -173,6 +185,15 @@ in
         message = ''
           a mkSecret reference has no matching mikrotik.secrets.<name> entry:
           ${toString undeclared}
+        '';
+      }
+      {
+        assertion = badSecretNames == [ ];
+        message = ''
+          these secret names are not usable as file names, and a secret name is
+          also the name of the file the deploy tool reads the value from:
+          letters, digits, dot, dash and underscore only, starting with a letter
+          or a digit (offending: ${toString badSecretNames})
         '';
       }
     ];

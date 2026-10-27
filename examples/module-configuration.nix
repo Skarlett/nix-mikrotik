@@ -1,7 +1,8 @@
 # The upstream example configuration, expressed in the `mikrotik` module class.
 #
 # `examples/configuration.nix` is kept exactly as upstream wrote it: it is the
-# compatibility fixture, and the renderer test renders it byte-for-byte. This
+# compatibility fixture, and the render check diffs this renderer against
+# upstream's own output for it (`tests/golden/legacy-upstream.rsc`). This
 # file is the same router written the way this fork expects -- as a module, so
 # it can import hardening.nix, it is type-checked, and its secrets are
 # references rather than strings.
@@ -109,7 +110,7 @@
       ];
 
       "/ip firewall nat" = [
-        { chain = "srcnat"; action = "masquerade"; out-interface-list = "WAN"; comment = "masquerade"; }
+        { chain = "srcnat"; action = "masquerade"; out-interface-list = "WAN"; comment = "masquerade (cost $5/GB)"; }
       ];
 
       # A secret in a section: the value never reaches the store.

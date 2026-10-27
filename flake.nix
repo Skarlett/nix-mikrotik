@@ -85,8 +85,9 @@
           };
 
           checks = {
-            # The renderer is byte-compatible with upstream for upstream's own
-            # example, and the module class adds the rest.
+            # The renderer against upstream's own generator's output for
+            # upstream's own example: the same `add`/`set` lines in the same
+            # order, plus four documented deviations (tests/golden/README.md).
             render = import ./tests/render.nix {
               inherit pkgs;
               inherit (mt) render;
@@ -94,11 +95,19 @@
               example = evaluated.example;
             };
 
-            # The CLI's secret handling: placeholders listed, substituted, and
-            # refused when a value is missing.
+            # The CLI's secret handling: placeholders listed, substituted with
+            # the quoting RouterOS needs, and refused when a value or a name is
+            # unusable.
             cli = import ./tests/cli.nix {
               inherit pkgs;
               nix-mikrotik = config.packages.nix-mikrotik;
+            };
+
+            # The class refuses what it says it refuses, with a diagnostic that
+            # names the fix: every assertion, plus the control that must pass.
+            eval = import ./tests/eval.nix {
+              inherit pkgs;
+              inherit (mt) evalMikrotik evalMikrotikRaw mkSecret;
             };
 
             # Boot the pinned CHR image and wait for a RouterOS login prompt.

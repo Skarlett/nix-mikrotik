@@ -1,0 +1,62 @@
+/interface bridge
+add auto-mac=no comment="defconf" name=bridge
+add name=wifi
+/interface bridge port
+add bridge=bridge interface=ether2
+add bridge=bridge interface=ether3
+add bridge=bridge interface=ether4
+add bridge=wifi interface=ether5
+add bridge=bridge interface=sfp1
+/interface list
+add name=LAN
+add name=WAN
+/interface list member
+add interface=bridge list=LAN
+add interface=ether1 list=WAN
+/ip address
+add address=10.10.10.1/24 interface=ether2 network=10.10.10.0
+add address=10.10.11.1/24 interface=wifi network=10.10.11.0
+/ip cloud
+set update-time=no
+/ip dhcp-client
+add disabled=no interface=ether1
+/ip dhcp-server
+add address-pool=wired-pool disabled=no interface=bridge name=wired-dhcp
+add address-pool=wifi-pool disabled=no interface=wifi name=wifi-dhcp
+/ip dhcp-server network
+add address=10.10.10.0/24 gateway=10.10.10.1 netmask=24
+add address=10.10.11.0/24 gateway=10.10.11.1 netmask=24
+/ip dns
+set allow-remote-requests=yes servers=1.1.1.1,1.0.0.1
+/ip dns static
+add address=10.10.10.1 name=router.lan
+/ip firewall address-list
+add address=10.10.10.10-10.10.10.10.254 list=allowed_to_router
+add action=accept chain=input src-address-list=allowed_to_router
+add action=accept chain=input protocol=icmp
+/ip neighbor discovery-settings
+set discover-interface-list=none
+/ip pool
+add name=wired-pool ranges=10.10.10.10-10.10.10.254
+add name=wifi-pool ranges=10.10.11.10-10.10.11.254
+/ip service
+set api disabled=yes
+set api-ssl disabled=yes
+set ftp disabled=yes
+set telnet disabled=yes
+set winbox disabled=yes
+set www disabled=yes
+/ip ssh
+set strong-crypto=yes
+/system clock
+set time-zone-name=Europe/Stockholm
+/system identity
+set name=nidas
+/tool bandwidth-server
+set enabled=no
+/tool mac-server
+set allowed-interface-list=none
+/tool mac-server mac-winbox
+set allowed-interface-list=none
+/tool mac-server ping
+set enabled=no

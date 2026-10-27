@@ -17,6 +17,17 @@ device the way it is onto a NixOS host. It is delivered here instead: the value
 is read on the deploying machine (from a clan var, a sops file, anywhere), put
 into a 0600 file under a 0700 temporary directory, uploaded, imported, and the
 uploaded copy is removed from the router afterwards.
+
+Two things about a RouterOS value this tool has to get right, because the
+device reports neither of them through ssh's exit status:
+
+  * a value that is not quoted when RouterOS needs it to be (a base64 key ends
+    in `=`) makes the device abort the *whole* script -- nothing is applied --
+    and `/import` still exits 0. Values are quoted here when they need it.
+  * a script the device refused to parse is indistinguishable from one it
+    applied, by status alone. `deploy` appends a one-line sentinel to the
+    uploaded copy and reads the device's log back, so a deploy that applied
+    nothing fails instead of printing "verified".
 """
 
 from __future__ import annotations
@@ -30,8 +41,35 @@ import sys
 import tempfile
 import time
 
-PLACEHOLDER_RE = re.compile(r"__MIKROTIK_SECRET_([A-Za-z0-9_.:/-]+)__")
 DEFAULT_SCRIPT_NAME = "router-config.rsc"
+
+# The name between the markers is also a file name in a secrets directory (see
+# README "Clan vars"), so it has to be one: a name carrying a path separator or
+# a `..` would let read_secret_files read outside the directory, and a name
+# outside this charset slips past an enumeration and gets uploaded as a literal
+# placeholder. modules/base.nix asserts the same rule when the configuration is
+# evaluated; this is the half that covers a script the tool was handed rather
+# than one it rendered.
+SECRET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+# Deliberately wider than SECRET_NAME_RE, because a script has to be *found* to
+# be refused. A matching pattern narrower than what a configuration can write
+# answers "no secret placeholders" for a name it cannot see, which is exactly
+# how a literal placeholder reaches a router.
+PLACEHOLDER_RE = re.compile(r"__MIKROTIK_SECRET_(.+?)__")
+
+# A substituted value is left bare only when it cannot be anything but one
+# token. Anything else -- a space, `=`, `;`, `#`, a quote -- is quoted and
+# escaped: RouterOS parses `key=value` with its own grammar and ends the
+# command early on those, and a base64 WireGuard private key (32 bytes, so
+# always a trailing `=`) is precisely the shape that aborts a whole import.
+BARE_VALUE_RE = re.compile(r"[A-Za-z0-9._:/@,+-]+")
+
+# The wording /import uses on a clean run. Only a fallback: the sentinel is the
+# signal, this is what still works if a device's logging has been turned down.
+IMPORT_OK_TEXT = "executed successfully"
+
+SENTINEL_PREFIX = "nix-mikrotik-import"
 
 
 class ToolError(Exception):
@@ -42,9 +80,35 @@ class ToolError(Exception):
 # placeholders
 # --------------------------------------------------------------------------
 
+def check_secret_name(name: str) -> str:
+    if not SECRET_NAME_RE.fullmatch(name):
+        raise ToolError(
+            f"secret name '{name}' is not usable as a file name: names must "
+            "match [A-Za-z0-9][A-Za-z0-9._-]* (no '/', no space, no '..')")
+    return name
+
+
+def routeros_value(value: str) -> str:
+    """A secret value, spelled the way RouterOS needs it in the slot it goes in.
+
+    Quoting is not cosmetic here. An unquoted value containing `=` -- which
+    every base64 private key is -- makes RouterOS end the command early, abort
+    the *entire* script and still exit 0, so the device keeps its old
+    configuration and the deploy looks like it worked. `"`, `\\` and `$` are
+    escaped the way RouterOS writes and reads them back: verified on 7.15.3 by
+    setting a value carrying all three and reading it back byte-identical,
+    against the same value left bare, which the device refuses to parse at all.
+    """
+    if BARE_VALUE_RE.fullmatch(value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    return f'"{escaped}"'
+
+
 def find_placeholders(text: str) -> list[str]:
     seen: list[str] = []
     for name in PLACEHOLDER_RE.findall(text):
+        check_secret_name(name)
         if name not in seen:
             seen.append(name)
     return seen
@@ -52,7 +116,7 @@ def find_placeholders(text: str) -> list[str]:
 
 def substitute(text: str, values: dict[str, str]) -> str:
     def repl(match: re.Match[str]) -> str:
-        name = match.group(1)
+        name = check_secret_name(match.group(1))
         if name not in values:
             raise ToolError(f"no value supplied for secret '{name}'")
         value = values[name]
@@ -60,7 +124,7 @@ def substitute(text: str, values: dict[str, str]) -> str:
         # corruption, not an error on the device. Refuse instead.
         if any(c in value for c in "\r\n"):
             raise ToolError(f"secret '{name}' contains a newline; refusing to render it")
-        return value
+        return routeros_value(value)
 
     return PLACEHOLDER_RE.sub(repl, text)
 
@@ -68,6 +132,10 @@ def substitute(text: str, values: dict[str, str]) -> str:
 def read_secret_files(directory: str, names: list[str]) -> dict[str, str]:
     values: dict[str, str] = {}
     for name in names:
+        # Belt and braces: the name is a path component, and every caller has
+        # already validated it, but this is the line that would read a file
+        # outside the directory if one ever did not.
+        check_secret_name(name)
         path = os.path.join(directory, name)
         if not os.path.isfile(path):
             continue
@@ -153,6 +221,22 @@ class Router:
         match = re.search(r"^\s*name:\s*(\S+)\s*$", out, re.M)
         return match.group(1) if match else None
 
+    def sentinel_seen(self, marker: str) -> bool:
+        """Did the sentinel line the tool appended actually run on the device?
+
+        This is the only positive signal a failed import leaves behind: a
+        script RouterOS refused to parse is logged and exits 0, exactly like
+        one that applied. The marker is logged by the script's own last line,
+        and only if the whole script ran.
+        """
+        out = self.run(f'/log print where message~"{marker}"')
+        return marker in out
+
+    def script_errors(self) -> list[str]:
+        """The device's own account of a script it could not run."""
+        out = self.run('/log print where topics~"script"')
+        return [line.strip() for line in out.splitlines() if "script,error" in line]
+
     def export(self) -> str:
         return self.run("/export terse")
 
@@ -228,12 +312,57 @@ def _secretize(script: str, secret_args: list[str], secrets_dir: str | None) -> 
 def cmd_secretize(args: argparse.Namespace) -> int:
     text, names = _secretize(args.script, args.secret, args.secrets_dir)
     destination = args.output
-    # 0600 from creation: this file holds plaintext secret values.
+    # 0600 from creation *and* afterwards: the mode passed to os.open applies
+    # only when the file is created, so secretizing into a destination that
+    # already exists (a 0644 one, from an earlier run of anything) would
+    # otherwise leave plaintext secrets world-readable.
     fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
+    os.chmod(destination, 0o600)
     print(f"{destination} ({len(names)} secret(s) substituted)", file=sys.stderr)
     return 0
+
+
+def new_sentinel() -> str:
+    """A per-deploy marker, so an old log entry cannot be mistaken for this one."""
+    return f"{SENTINEL_PREFIX}-{os.urandom(8).hex()}"
+
+
+def sentinel_line(marker: str) -> str:
+    """The line appended to the uploaded copy, and why it is there.
+
+    RouterOS compiles an imported script before running any of it, so this line
+    runs only if the whole script ran -- which is what makes a failed import
+    detectable at all. It is a log entry rather than a file so that nothing has
+    to be cleaned up on the device, and the marker is unique per deploy.
+    """
+    return f'\n:log info "{marker}"\n'
+
+
+def check_applied(router: Router, marker: str, output: str) -> None:
+    """Refuse to call a deploy successful when the device applied nothing.
+
+    `/import` answers a script it cannot parse by logging the error and exiting
+    **0**, so ssh's status says "fine" whether the configuration applied or the
+    import was refused outright (verified on 7.15.3: an unquoted base64 key
+    produced an empty stdout, an unchanged identity and rc=0). The positive
+    signal is the sentinel line: a clean run logs it and prints "…executed
+    successfully"; a parse error produces neither, and a runtime error stops
+    before the sentinel does.
+    """
+    if IMPORT_OK_TEXT in output:
+        return
+    for _attempt in range(3):
+        if router.sentinel_seen(marker):
+            return
+        time.sleep(1)
+    errors = router.script_errors()[-5:]
+    detail = "\n".join(errors) if errors else "(no script error in the device log)"
+    raise ToolError(
+        "the import did not run to the end, so the device kept its previous "
+        "configuration: RouterOS aborts the whole script on a value or a line "
+        f"it cannot parse, and exits 0 either way.\n{detail}")
 
 
 def cmd_deploy(args: argparse.Namespace) -> int:
@@ -248,11 +377,12 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     workdir = tempfile.mkdtemp(prefix="nix-mikrotik-")
     os.chmod(workdir, 0o700)
     remote = None
+    marker = new_sentinel()
     try:
         staged = os.path.join(workdir, DEFAULT_SCRIPT_NAME)
         fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
+            handle.write(text + sentinel_line(marker))
 
         print(f"uploading to {args.user}@{args.host}:{args.port}", file=sys.stderr)
         remote = router.upload(staged)
@@ -272,9 +402,11 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             print("device is rebooting; waiting for it to come back",
                   file=sys.stderr)
             _wait_for_router(router, args.wait)
+            check_applied(router, marker, "")
         else:
             print("importing", file=sys.stderr)
-            router.run(f'/import file-name="{remote}"')
+            output = router.run(f'/import file-name="{remote}"')
+            check_applied(router, marker, output)
     finally:
         if remote:
             router.remove(remote)

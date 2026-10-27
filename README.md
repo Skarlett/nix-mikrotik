@@ -16,8 +16,14 @@ is kept and everything around it is built out:
 | **deploy tool** | `nix-mikrotik deploy` uploads, imports, verifies and cleans up |
 | **a real RouterOS to test against** | pinned CHR images, and a two-VM lab, so a script is proven before it reaches a router |
 
-Upstream's example still renders byte-for-byte (`tests/golden/legacy.rsc`), and
-`nix-build mikrotik.nix` still works.
+Upstream's example still renders, and `nix-build mikrotik.nix` still works. It is
+not byte-identical any more, and the render check no longer pretends it is:
+every `add`/`set` line comes out the same, in upstream's order, plus four
+deliberate deviations (a generated header, `/system identity` first with a quoted
+value, a final newline, and pinned section order). `tests/golden/legacy-upstream.rsc`
+is upstream's own generator's output for that fixture, committed as it came out;
+the check asserts the deviations by name and diffs everything else against it.
+`tests/golden/README.md` lists them and says how to regenerate the file.
 
 ## Quick start
 
@@ -93,7 +99,18 @@ the way it is onto a NixOS host. It is **delivered** instead:
    into a `0600` file under a `0700` temporary directory;
 4. it uploads, imports, and **removes the uploaded copy from the router**,
    because that file holds the plaintext secret;
-5. it refuses to deploy at all if any placeholder is unresolved.
+5. it refuses to deploy at all if any placeholder is unresolved — and it refuses
+   a placeholder *name* that is not usable as a file name
+   (`[A-Za-z0-9][A-Za-z0-9._-]*`), because that name is also the file the value
+   is read from;
+6. the value is **quoted and escaped** the way RouterOS needs it (`"`, `\`, `$`)
+   before it goes into the line: an unquoted base64 key — every WireGuard
+   private key — makes the device end the command early, abort the whole script
+   and still exit 0;
+7. a script the device refused to parse is therefore a **failure, not a silent
+   no-op**: `deploy` appends a one-line sentinel to the uploaded copy and reads
+   the device's log back, so it cannot print `verified` for an import that
+   applied nothing.
 
 ```sh
 nix-mikrotik deploy router.rsc --host 10.0.0.1 \
@@ -115,6 +132,12 @@ to the machine that holds the value, so the fleet's lives in `Infra/lunix`,
 What makes the two halves fit is one convention:
 
 > **the generator's file names are the `mkSecret` names.**
+
+A name is therefore constrained to `[A-Za-z0-9][A-Za-z0-9._-]*`: a dot-file
+name, a name with a `/` or a `..` is not a file name in a directory and not a
+`mkSecret` name either. The renderer asserts it (`modules/base.nix`), so it is a
+build failure rather than a placeholder the tool silently skips or a path it
+reads from outside `--secrets-dir`.
 
 So the directory clan deploys the vars into *is* a secrets directory, and the
 deploy is one command with no mapping layer:
@@ -161,6 +184,9 @@ nix-mikrotik diff router.rsc --host 10.0.0.1
 * `deploy` **imports** by default, which merges into the running
   configuration. RouterOS has no reconciliation — a repeated `add` makes a
   second object — so importing the same script twice is not idempotent.
+* a refused import is a failure, not a silent no-op: RouterOS logs a parse error
+  and still exits 0, so `deploy` appends a sentinel line to the uploaded copy and
+  reads the device's log back before it reports success.
 * `deploy --reset --yes` runs `/system reset-configuration
   no-defaults=yes run-after-reset=…` instead: the device reboots into exactly
   the script. That is the declarative path, and it wipes the configuration.
@@ -203,7 +229,7 @@ modules/        base.nix (the class), hardening.nix (composable defaults)
 pkgs/           the nix-mikrotik CLI
 chr/            pinned CHR images and the two-VM lab
 examples/       module-configuration.nix, plus upstream's untouched example
-tests/          render (golden), cli, chr-smoke
+tests/          render (two goldens), cli, eval, chr-smoke
 ```
 
 ## Differences from upstream
