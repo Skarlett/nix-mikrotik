@@ -16,8 +16,14 @@ is kept and everything around it is built out:
 | **deploy tool** | `nix-mikrotik deploy` uploads, imports, verifies and cleans up |
 | **a real RouterOS to test against** | pinned CHR images, and a two-VM lab, so a script is proven before it reaches a router |
 
-Upstream's example still renders byte-for-byte (`tests/golden/legacy.rsc`), and
-`nix-build mikrotik.nix` still works.
+Upstream's example still renders, and `nix-build mikrotik.nix` still works. It is
+not byte-identical any more, and the render check no longer pretends it is:
+every `add`/`set` line comes out the same, in upstream's order, plus four
+deliberate deviations (a generated header, `/system identity` first with a quoted
+value, a final newline, and pinned section order). `tests/golden/legacy-upstream.rsc`
+is upstream's own generator's output for that fixture, committed as it came out;
+the check asserts the deviations by name and diffs everything else against it.
+`tests/golden/README.md` lists them and says how to regenerate the file.
 
 ## Quick start
 
@@ -180,7 +186,21 @@ the way it is onto a NixOS host. It is **delivered** instead:
    into a `0600` file under a `0700` temporary directory;
 4. it uploads, imports, and **removes the uploaded copy from the router**,
    because that file holds the plaintext secret;
-5. it refuses to deploy at all if any placeholder is unresolved.
+5. it refuses to deploy at all if any placeholder is unresolved — and it refuses
+   a placeholder *name* that is not usable as a file name
+   (`[A-Za-z0-9][A-Za-z0-9._-]*`), because that name is also the file the value
+   is read from;
+6. the value is **quoted and escaped** the way RouterOS needs it (`"`, `\`, `$`)
+   before it goes into the line: an unquoted base64 key — every WireGuard
+   private key — makes the device end the command early, abort the whole script
+   and still exit 0;
+7. a script the device did not finish running is a **failure, not a silent
+   no-op**: `deploy` appends a one-line sentinel to the uploaded copy and reads
+   the device's log back, so it cannot print `verified` for an import that
+   stopped early. What stopped it is not recoverable — a parse abort applies
+   nothing, a runtime abort has already applied a prefix — so the failure says
+   exactly that rather than claiming the device is unchanged, and warns that a
+   re-run can duplicate what the first attempt managed to apply.
 
 ```sh
 nix-mikrotik deploy router.rsc --host 10.0.0.1 \
@@ -202,6 +222,12 @@ to the machine that holds the value, so the fleet's lives in `Infra/lunix`,
 What makes the two halves fit is one convention:
 
 > **the generator's file names are the `mkSecret` names.**
+
+A name is therefore constrained to `[A-Za-z0-9][A-Za-z0-9._-]*`: a dot-file
+name, a name with a `/` or a `..` is not a file name in a directory and not a
+`mkSecret` name either. The renderer asserts it (`modules/base.nix`), so it is a
+build failure rather than a placeholder the tool silently skips or a path it
+reads from outside `--secrets-dir`.
 
 So the directory clan deploys the vars into *is* a secrets directory, and the
 deploy is one command with no mapping layer:
@@ -245,9 +271,32 @@ nix-mikrotik diff router.rsc --host 10.0.0.1
 
 * Transport is the system `ssh`/`scp`: key-based auth against the router's
   `admin` user, no library, no password handling of our own.
+* `--known-hosts PATH` is the one thing the transport will not take from the
+  operator's environment. `accept-new` learns a host key by appending it to
+  ssh's known_hosts file, and that `~` comes from the passwd entry rather than
+  `$HOME` — so a caller with no operator home (a systemd unit as root under
+  `ProtectHome = true`) has nowhere to record one and every deploy is a first
+  contact. Pass a path the caller *can* write (ccpkgs' `services.mikrotik` hands
+  the unit a `StateDirectory`-backed file) and the pin is learned again. A path
+  whose directory does not exist is refused: ssh treats a failed append as a
+  warning, so the alternative is a deploy that looks pinned and is not. Only the
+  file is selectable — `accept-new` still means accept-new, and a key pinned
+  machine-wide in `/etc/ssh/ssh_known_hosts` is still read.
+* `deploy --reset` **without** `--yes` is refused before anything happens:
+  before the transport, and before a secret value is read. It used to be refused
+  after the secretized script had already been uploaded, which made the
+  confirmation not the guard it reads as.
 * `deploy` **imports** by default, which merges into the running
   configuration. RouterOS has no reconciliation — a repeated `add` makes a
   second object — so importing the same script twice is not idempotent.
+* an import that did not run to the end is a failure, not a silent no-op:
+  RouterOS logs a parse error and still exits 0, so `deploy` appends a sentinel
+  line to the uploaded copy and reads the device's log back before it reports
+  success. When the sentinel never appears it exits 2 and says **a prefix of the
+  script may have been applied** — the tool cannot tell a parse abort (nothing
+  applied) from a runtime one (everything above the failing line applied).
+  Check the device (`nix-mikrotik diff`) before re-deploying: a repeated `add`
+  makes a second object.
 * `deploy --reset --yes` runs `/system reset-configuration
   no-defaults=yes run-after-reset=…` instead: the device reboots into exactly
   the script. That is the declarative path, and it wipes the configuration.
@@ -287,6 +336,57 @@ configuration written both ways, a typed/section hybrid (to pin the merge order)
 and every menu in the table, and requires the typed render to be byte-identical
 to the section render.
 
+`checks.chr-deploy` goes further: it boots that image, applies a rendered
+configuration to the device, and reads the device's state back. It is the only
+check that can answer whether RouterOS *accepts* what the renderer produced —
+`/import` exits 0 for a script the device refused to parse, so nothing about the
+build itself can. What it asserts, all read over REST afterwards:
+
+* the identity, a bridge with an address on it, and a dhcp-server drawing from a
+  pool created earlier in the same script (section order is real);
+* a firewall comment carrying `$`, and a *secret* substituted into a dns
+  comment, both read back byte for byte;
+* the interface whose line carries the substituted WireGuard key — it exists at
+  all only if the whole script ran, because unquoted that base64 `=` padding
+  makes the device refuse the script from its first line;
+* the uploaded copy is gone from the device afterwards;
+* and, the other way round, that a deliberately broken script **fails** the
+  deploy, with the device's own `script error: expected end of command` in the
+  log and nothing applied. A check whose subject always applies cannot be shown
+  to fail, so the refusal is part of the check rather than a claim about it.
+
+`tests/chr-deploy.py` is the whole of it and needs nothing from nix, so it also
+runs against a CHR from the lab above — which is how its assertions were written:
+
+```sh
+nix run .#chr-lab -- start
+script=$(nix build --no-link --print-out-paths .#mikrotik-chr-fixture-script)
+cli=$(nix build --no-link --print-out-paths .#nix-mikrotik)
+tests/chr-deploy.py --host 127.0.0.1 --ssh-port 2201 --rest-port 8081 \
+  --script "$script/router-config.rsc" --expect-hostname chr-deploy \
+  --secret 'wg-private-key=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=' \
+  --secret 'dns-comment=a"b\c$d' \
+  --broken-script tests/fixtures/refused.rsc --cli "$cli/bin/nix-mikrotik"
+```
+
+It bootstraps its own ssh access rather than needing a console: it serves a
+fresh public key to the guest at `http://10.0.2.2:<port>/` and has the device
+import it over REST (`POST /tool/fetch`, then `POST /user/ssh-keys/import`),
+then removes it again. The `--secret` values are obviously fake, and the fixture
+is the only configuration here that a CHR can actually hold — the examples name
+`ether2` … `sfp1` (see "Not done yet").
+
+Two lab notes this leaves behind: a CHR rebuilt at a host:port you have already
+deployed to comes back with a **new ssh host key**, and the deploy tool's
+`accept-new` then refuses it (OpenSSH reads `known_hosts` from the password
+database, not from `$HOME`, so nothing redirects it) — clear it with
+`ssh-keygen -R '[127.0.0.1]:2201'`, or use a port you have not deployed to.
+Inside the nixos test that cannot arise. And RouterOS logs `script,error
+executing script from sshd failed` for *any* command a client runs over ssh that
+exits non-zero — including the deploy's own `/file remove`, which is retried
+because it races the import — so that line is not evidence about a script; the
+device's `script error: …` line is.
+
 ## Layout
 
 ```
@@ -298,7 +398,10 @@ pkgs/           the nix-mikrotik CLI
 chr/            pinned CHR images and the two-VM lab
 examples/       module-configuration.nix and its typed twin, plus upstream's
                 untouched example
-tests/          render (golden), menus (typed vs sections), cli, chr-smoke
+tests/          render (two goldens), menus (typed vs sections), cli, eval,
+                chr-smoke, chr-deploy
+                (+ fixtures/: the configuration a CHR is given, and a script it
+                must refuse)
 ```
 
 ## Differences from upstream
@@ -325,3 +428,13 @@ tests/          render (golden), menus (typed vs sections), cli, chr-smoke
   convergent mode, and it is destructive.
 * **`/export`-based import of existing routers**: the migration path is still
   "read the export, write the module by hand".
+* **the examples on a CHR**: both describe a router with `ether2` … `ether5` and
+  `sfp1`, and a CHR has one ethernet port, so an `/ip address … interface=ether2`
+  line is refused at runtime (`script error: input does not match any value of
+  interface`, measured on 7.15.3 — with the identity, both bridges and the vlan
+  above it already applied). They are upstream's router, ported, and stay as
+  they are; `checks.chr-deploy` applies `tests/fixtures/chr-configuration.nix`,
+  which is written for a CHR.
+* **the deploy tool's ssh trust**: `deploy`/`diff` accept `--host`, `--port` and
+  `--key`, but not a known-hosts file, so a rebuilt lab device is refused at the
+  same `host:port` until the stale key is removed by hand (`ssh-keygen -R`).

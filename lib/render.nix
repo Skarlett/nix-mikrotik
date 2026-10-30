@@ -5,10 +5,13 @@
 # that the module layer can stay typed and the deploy tool can stay dumb.
 #
 # The value formatting is ported from upstream's `mikrotik.nix` (the
-# `formatValue`/`formatSection` pair) so that every configuration written for
-# the original single-file generator renders byte-identically here. The
-# additions are: secret placeholders, booleans/ints, comment quoting, section
-# ordering and a generated-file header.
+# `formatValue`/`formatSection` pair), so a configuration written for the
+# original single-file generator renders here with every `add`/`set` line
+# unchanged -- which `tests/golden/legacy-upstream.rsc`, produced by upstream's
+# own generator, is what proves. The additions are: secret placeholders,
+# booleans/ints, comment quoting, section ordering, `/system identity` first,
+# and a generated-file header. They are listed with the golden (see
+# `tests/golden/README.md`) rather than described as byte-identity.
 { lib }:
 let
   inherit (lib)
@@ -31,10 +34,14 @@ let
     else throw "nix-mikrotik: unsupported scalar value ${builtins.toJSON v}";
 
   # A quoted value (comments) may contain a quote; RouterOS escapes with a
-  # backslash, and an unescaped one truncates the value silently.
+  # backslash, and an unescaped one truncates the value silently. A `$` inside
+  # double quotes starts a variable reference, so it is escaped as well. All
+  # three are escaped the way RouterOS reads them back: verified on 7.15.3 by
+  # importing a comment carrying `"`, `\` and `$` and reading it back
+  # byte-identical (the deploy tool's substitution path is the same escaping).
   # replaceStrings is simultaneous, so the backslash pass cannot double up.
-  escapeQuotes = s: builtins.replaceStrings [ "\\" "\"" ] [ "\\\\" "\\\"" ] s;
-  quoted = v: "\"${escapeQuotes (scalar v)}\"";
+  escape = s: builtins.replaceStrings [ "\\" "\"" "$" ] [ "\\\\" "\\\"" "\\$" ] s;
+  quoted = v: "\"${escape (scalar v)}\"";
 
   # RouterOS parses `key=value` with its own grammar and a value that contains
   # a space, `=`, `;`, a quote, a backslash or a `$` ends the command early:
@@ -47,6 +54,11 @@ let
 
   formatValue = key: value:
     if isSecret value then
+      # The placeholder goes in *bare*, and the deploy tool decides how the
+      # value it stands for has to be spelled -- it holds the value, and the
+      # value is what has to be quoted and escaped (a base64 key always ends in
+      # `=`). Rendering the marker quoted here would substitute a value into a
+      # slot that is already a string, which is a different question.
       (if key == null then placeholder value.__mikrotikSecret
        else "${key}=${placeholder value.__mikrotikSecret}")
     else if key == "comment" then

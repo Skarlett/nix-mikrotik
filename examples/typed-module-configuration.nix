@@ -145,7 +145,7 @@
       ];
 
       firewall.nat = [
-        { chain = "srcnat"; action = "masquerade"; out-interface-list = "WAN"; comment = "masquerade"; }
+        { chain = "srcnat"; action = "masquerade"; out-interface-list = "WAN"; comment = "masquerade (cost $5/GB)"; }
       ];
     };
 
