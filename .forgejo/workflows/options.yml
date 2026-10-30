@@ -1,0 +1,82 @@
+name: options
+
+# `lib/menus.nix` is hand-maintained: per RouterOS menu, the attribute names a
+# body may use. The typed surface turns a name it does not list into an
+# evaluation error, so the table is a promise to every repository that consumes
+# this one -- and the way a promise like that breaks is quiet: the fleet grows an
+# attribute, the table does not learn about it, and the failure lands in the
+# fleet's repository rather than here, where the table lives.
+#
+# Two jobs. The first is the ordinary gate: the table is self-consistent, both
+# spellings render identically, and every menu in it is reachable. The second
+# asks the question from this side -- render the fleet's routers against *this*
+# checkout and report anything the table is missing -- so the library learns it
+# is behind without waiting for a fleet pull request to say so.
+#
+# The fleet is fetched at run time, not declared as a flake input: it depends on
+# this repository, so an input would be a cycle.
+#
+# `runs-on: native` is this fleet's host executor (the machine itself, with nix
+# and git on PATH). No `uses:` steps: fetching an action would reach
+# data.forgejo.org, which is not what this is testing.
+
+on:
+  pull_request:
+  push:
+    branches: [master, feat/mikrotik-modules]
+  schedule:
+    # Daily. The table only goes stale when someone edits the fleet, so this does
+    # not need to be frequent -- it needs to exist.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  table:
+    name: the menu table is self-consistent
+    runs-on: native
+    steps:
+      - name: check out this ref
+        run: |
+          set -eu
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" 2>/dev/null || true
+          git fetch -q --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+
+      - name: both spellings render identically, every menu reachable, typos refused
+        run: |
+          nix build --no-link -L \
+            .#checks.x86_64-linux.menus \
+            .#checks.x86_64-linux.render \
+            .#checks.x86_64-linux.cli \
+            .#checks.x86_64-linux.eval
+
+  fleet-coverage:
+    name: the table still describes what the fleet uses
+    # Only on the schedule and on demand: it needs the fleet, and a pull request
+    # to this repository has no reason to wait on another repository's checkout.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: native
+    steps:
+      - name: check out this ref
+        run: |
+          set -eu
+          git init -q .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" 2>/dev/null || true
+          git fetch -q --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+
+      - name: fetch the fleet at its default branch
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${TOKEN:-}" ]; then
+            echo "no GITHUB_TOKEN: the fleet repository is private, so this job cannot ask the question." >&2
+            exit 2
+          fi
+          git clone -q --depth 1 \
+            "https://oauth2:${TOKEN}@${GITHUB_SERVER_URL#https://}/Infra/lunix.git" /tmp/lunix
+
+      - name: compare the table with what the fleet renders
+        run: bash scripts/menu-coverage.sh /tmp/lunix
