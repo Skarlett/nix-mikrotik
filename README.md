@@ -146,8 +146,8 @@ was rejected: it taxes every menu for the shape of five.
 step: `mikrotik.ip."dhcp-server".network`. That is accepted as the ergonomics
 rather than papered over with a mapping table (a table would need a name per
 menu, two spellings to keep in step, and would break the property that the
-option path *is* the RouterOS path). Eleven of the menus need it; the quoting
-is standard Nix and survives `nix fmt` untouched.
+option path *is* the RouterOS path). Twelve of the thirty-six menus need it;
+the quoting is standard Nix and survives `nix fmt` untouched.
 
 ### Mixing the two, and the order of `add` lines
 
