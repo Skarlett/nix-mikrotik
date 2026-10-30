@@ -82,7 +82,10 @@ let
       ip.dns.items = {
         no_label = { allow-remote-requests = true; servers = "1.1.1.1"; };
       };
-      ip.service = {
+      # `/ip service` gained `/ip service webserver` in the generated table, so
+      # its service names are `items` now -- the same wrapper as every other
+      # menu that has a submenu.
+      ip.service.items = {
         ftp = { disabled = true; };
         ssh = { vrf = "vrf.mgmt"; };
       };

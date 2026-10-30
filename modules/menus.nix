@@ -47,8 +47,23 @@ let
     lib.any (o: o.path != m.path && hasPrefix "${m.path} " o.path) menus;
 
   # Where the user writes this menu's body: at the menu's own attribute path,
-  # plus `items` when the menu also has submenus.
-  accessPath = m: segments m ++ optional (hasChildren m) "items";
+  # plus `items` when the menu has submenus.
+  #
+  # This is not a stylistic choice. A submenu needs `mikrotik.interface.6to4` to
+  # be an attribute *set of options*, so the parent cannot also be a single
+  # option at that path -- and that is true whether the parent's body is a list
+  # or a `set` body. `/interface` is the case that proves it: it is a real
+  # `set`-able menu (`/interface set mtu=…` applies to every port) *and* the
+  # parent of 96 menus, so without `items` the option tree and the body collide
+  # and nothing evaluates.
+  #
+  # The cost is real -- a full generated table gives nine menus a submenu nobody
+  # writes and therefore an `items` wrapper -- and it is paid once, in the
+  # configurations that write those menus, rather than by making the option tree
+  # depend on where the collision happens to be.
+  needsItems = hasChildren;
+
+  accessPath = m: segments m ++ optional (needsItems m) "items";
 
   bodyType = m: if m.kind == "list" then typeLib.menuItems else typeLib.menuObject;
 
@@ -61,9 +76,10 @@ let
     default = emptyBody m;
     description = ''
       RouterOS `${m.path}`, rendered as ${renderVerb m}.
-      ${optionalString (hasChildren m) ''
-        Written under `items`, because the menu also has submenus: this
-        attribute set holds them and `items` holds this menu's own objects.
+      ${optionalString (needsItems m) ''
+        Written under `items`: this attribute set holds the menu's submenus,
+        and `items` holds its own objects, because the two cannot share one
+        attribute set.
       ''}
       ${optionalString (m.attrs != null) ''
         Known attribute names: ${concatStringsSep ", " (map (a: "`${a}`") m.attrs)}.

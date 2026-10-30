@@ -90,7 +90,7 @@
         }
       ];
 
-      wifi.security = [
+      wifi.security.items = [
         {
           name = "default";
           authentication-types = "wpa2-psk";
@@ -100,7 +100,7 @@
     };
 
     ip = {
-      pool = [
+      pool.items = [
         { name = "wired-pool"; ranges = "10.10.10.10-10.10.10.254"; }
         { name = "wifi-pool"; ranges = "10.10.11.10-10.10.11.254"; }
       ];
@@ -120,7 +120,7 @@
         { address = "10.10.11.0/24"; gateway = "10.10.11.1"; netmask = "24"; }
       ];
 
-      "dhcp-client" = [ { interface = "ether1"; disabled = false; } ];
+      "dhcp-client".items = [ { interface = "ether1"; disabled = false; } ];
 
       # `no_label` is upstream's spelling for a menu whose `set` arguments are
       # written as one line rather than as a sub-object. `/ip dns` has `/ip dns
@@ -149,6 +149,8 @@
       ];
     };
 
-    system.clock = { time-zone-name = "Europe/Stockholm"; };
+    # `/system clock` has `/system clock manual` under it, so its body is
+    # `items` -- the wrapper is the price of the submenu existing at all.
+    system.clock.items = { time-zone-name = "Europe/Stockholm"; };
   };
 }
