@@ -12,10 +12,11 @@ let
 
   # RouterOS menus nest arbitrarily (`{ no_label = { a = "b"; }; }`), so the
   # section body is checked structurally and validated again at render time.
-  sectionBody = types.oneOf [
-    (types.attrsOf types.anything)
-    (types.listOf (types.attrsOf types.anything))
-  ];
+  #
+  # The typed menu options (modules/menus.nix) are built from the same file, so
+  # the two spellings accept the same values -- which is why a configuration may
+  # move one menu at a time from `sections` to the typed options.
+  inherit (import ../lib/types.nix { inherit lib; }) sectionBody;
 
   # Collect every `mkSecret "name"` reference anywhere under a value.
   secretRefs = v:
@@ -80,6 +81,11 @@ in
         repeated `add …` lines. This is upstream's data model, unchanged, so an
         existing configuration ports over by wrapping it in
         `mikrotik.sections`.
+
+        The menus in `lib/menus.nix` are also options in their own right
+        (`mikrotik.ip."dhcp-server".network`), which is the same thing spelled
+        as an attribute path. Both render identically and may be mixed; this
+        option stays the way to reach a menu the table does not list.
       '';
       example = literalExpression ''
         {

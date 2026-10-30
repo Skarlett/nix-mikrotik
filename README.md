@@ -69,9 +69,11 @@ and a section defined in two modules merges rather than colliding.
 |---|---|
 | `mikrotik.hostname` | `/system identity`; rendered first, and read back by the deploy tool |
 | `mikrotik.sections` | RouterOS menus keyed by command path — upstream's data model, unchanged |
+| `mikrotik.<menu>` | the same menus as options, one per menu, e.g. `mikrotik.ip."dhcp-server".network` (see below) |
 | `mikrotik.sectionOrder` | sections to render first, for objects that must exist before they are referenced |
 | `mikrotik.secrets` | secrets the configuration references, by name |
 | `mikrotik.extraScript` | raw lines appended verbatim, for anything the data model cannot express |
+| `mikrotik.checkMenuAttributes` | reject an attribute name a menu does not list (on) |
 
 Assertions fail the *evaluation*, not a device: an empty hostname, a section
 path that is not a RouterOS command path, a `mkSecret` with no matching
@@ -79,6 +81,91 @@ declaration, or a `/system identity` section that would fight the option.
 
 Booleans render as `yes`/`no` and integers bare, so a configuration reads like
 Nix rather than like a stringly-typed script.
+
+## The menu options
+
+Every menu in `lib/menus.nix` is also an option, at the path `/export` gives it
+with the slashes dropped and the spaces turned into dots:
+
+```nix
+mikrotik.ip."dhcp-server".network = [
+  { address = "172.29.82.0/24"; gateway = "172.29.82.1"; dns-server = "1.1.1.1,8.8.8.8"; }
+];
+```
+
+rather than
+
+```nix
+mikrotik.sections."/ip dhcp-server network" = [
+  { address = "172.29.82.0/24"; gateway = "172.29.82.1"; dns-server = "1.1.1.1,8.8.8.8"; }
+];
+```
+
+The two are the same value: the typed layer is a front end that compiles into
+`mikrotik.sections`, so the renderer never learns which spelling produced a
+script. `checks.menus` renders `examples/module-configuration.nix` and
+`examples/typed-module-configuration.nix` and requires the bytes to match, and
+the fleet's homelab router, transliterated into the typed options, renders the
+same 62-statement script (same `sha256`) as the module it ships today.
+
+What the spelling buys:
+
+* **a menu typo is an evaluation error**, not a `script error` on a live router
+  at import time — `mikrotik.ip."dhcp-servr"` does not exist, and the module
+  system says so and suggests `dhcp-server`;
+* **an attribute typo is an evaluation error too**, because each menu lists the
+  attribute names it knows (also from `lib/menus.nix`). Misspell `address` and
+  evaluation stops with the menu, the name and the alternatives;
+* the menu path is an attribute path, so it is discoverable — `nix repl`, an
+  editor's completion and `nixos-option`-style inspection all work on it.
+
+### Menus with submenus: `items`
+
+`/interface wireguard` is a list of interfaces and `/interface wireguard peers`
+is a list of peers, so `interface.wireguard` would have to be both a list and an
+attrset of children. A menu that has submenus carries its own body under
+`items`; every other menu is written directly:
+
+```nix
+mikrotik.interface.wireguard.items = [ { name = "wg0"; listen-port = 51820; private-key = mkSecret "wg0"; } ];
+mikrotik.interface.wireguard.peers = [ { interface = "wg0"; name = "peer1"; public-key = "…"; } ];
+
+mikrotik.ip.address = [ { address = "10.0.0.3/24"; interface = "vlan10"; network = "10.0.0.0"; } ];
+```
+
+`items` is one rule for every such menu (`/interface bridge` +
+`/interface bridge port`, `/ip dhcp-server` + `/ip dhcp-server network`,
+`/interface list` + `/interface list member`, `/ip dns` + `/ip dns static`,
+`/tool mac-server` + its two children), rather than a per-menu name to remember.
+The alternative — always writing a wrapper, so the collision case is uniform —
+was rejected: it taxes every menu for the shape of five.
+
+### Dashes in menu names
+
+`dhcp-server` is not a Nix identifier, so the attribute path needs a quoting
+step: `mikrotik.ip."dhcp-server".network`. That is accepted as the ergonomics
+rather than papered over with a mapping table (a table would need a name per
+menu, two spellings to keep in step, and would break the property that the
+option path *is* the RouterOS path). Eleven of the menus need it; the quoting
+is standard Nix and survives `nix fmt` untouched.
+
+### Mixing the two, and the order of `add` lines
+
+A path written both ways merges, exactly as two `sections` definitions always
+have — so a menu can move over one at a time, and a module still written against
+`sections` (this repository's `hardening.nix`, the fleet's fabric) keeps
+composing with one written against the menu options. Definitions merge in
+reverse module order and the menus module is part of the class, so a typed menu's
+lines come **after** the `sections` lines for the same path; `checks.menus`
+pins that order rather than leaving it to be discovered.
+
+`mikrotik.sectionOrder` keeps taking section paths (`"/ip dhcp-server"`): a menu
+path is the same string with `.` for ` ` and a leading `/`.
+
+Anything `lib/menus.nix` does not list is still expressible through
+`mikrotik.sections` and `mikrotik.extraScript`. The table is not a RouterOS
+schema (RouterOS ships none); it is what the fleet, the examples and the CRS226's
+own `/export` use, and adding a menu or an attribute is one line in that file.
 
 ## Secrets
 
@@ -195,15 +282,23 @@ Two things about CHR that cost time if you do not know them:
 `checks.chr-smoke` boots the pinned image and waits for the RouterOS login
 prompt, so a broken image pin fails the build rather than a lab session.
 
+`checks.menus` is the one that guards the two spellings: it renders one
+configuration written both ways, a typed/section hybrid (to pin the merge order),
+and every menu in the table, and requires the typed render to be byte-identical
+to the section render.
+
 ## Layout
 
 ```
-lib/            evalMikrotik, mkSecret, mkRouterScript, the renderer
-modules/        base.nix (the class), hardening.nix (composable defaults)
+lib/            evalMikrotik, mkSecret, mkRouterScript, the renderer, the menu
+                table (menus.nix) and the value types (types.nix)
+modules/        base.nix (the class), menus.nix (the typed menu options),
+                hardening.nix (composable defaults)
 pkgs/           the nix-mikrotik CLI
 chr/            pinned CHR images and the two-VM lab
-examples/       module-configuration.nix, plus upstream's untouched example
-tests/          render (golden), cli, chr-smoke
+examples/       module-configuration.nix and its typed twin, plus upstream's
+                untouched example
+tests/          render (golden), menus (typed vs sections), cli, chr-smoke
 ```
 
 ## Differences from upstream
@@ -213,6 +308,9 @@ tests/          render (golden), cli, chr-smoke
 * `/system identity` is an option, so the deploy tool can verify a device;
 * secrets are references, not strings;
 * booleans and integers are typed rather than written as `"yes"`/`"no"`;
+* every menu is a typed option as well as a `sections` key
+  (`mikrotik.ip."dhcp-server".network`), with the attribute names it knows, so a
+  misspelt menu or attribute fails evaluation instead of a router import;
 * section order can be pinned;
 * upstream's example puts two `action=`/`chain=` entries under
   `/ip firewall address-list`, where RouterOS will reject them;

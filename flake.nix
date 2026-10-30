@@ -20,6 +20,9 @@
       exampleModules = {
         # The router written the way this fork expects.
         example = [ ./examples/module-configuration.nix ];
+        # The same router with the typed menu options instead of string-keyed
+        # sections; `checks.menus` requires the two renders to be identical.
+        typed = [ ./examples/typed-module-configuration.nix ];
         # Upstream's configuration, wrapped rather than rewritten: proof that an
         # existing config ports by moving it under `mikrotik.sections`.
         legacy = [ ./examples/legacy-wrapper.nix ];
@@ -40,6 +43,10 @@
         mikrotikModules = {
           base = ./modules/base.nix;
           hardening = ./modules/hardening.nix;
+          # The typed menu options. It is part of the class, so `evalMikrotik`
+          # always includes it; exporting it here is for consumers that build a
+          # module list by hand.
+          menus = ./modules/menus.nix;
         };
 
         mikrotikConfigurations = lib.mapAttrs
@@ -92,6 +99,14 @@
               inherit (mt) render;
               legacy = evaluated.legacy;
               example = evaluated.example;
+            };
+
+            # The typed menu options render what `sections` renders: one
+            # configuration written both ways, byte-compared.
+            menus = import ./tests/menus.nix {
+              inherit pkgs lib;
+              inherit (mt) evalMikrotik render menus;
+              inherit (evaluated) example typed;
             };
 
             # The CLI's secret handling: placeholders listed, substituted, and
