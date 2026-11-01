@@ -147,6 +147,35 @@ def read_secret_files(directory: str, names: list[str]) -> dict[str, str]:
     return values
 
 
+def read_secret_command(template: str, names: list[str]) -> dict[str, str]:
+    """Resolve secrets by running a command per name, instead of reading files.
+
+    For a deploy host that must not *hold* the router's secrets: the values stay
+    where they are (a sops file, a vault) and are fetched at deploy time,
+    decrypted in memory, substituted, and gone when the process exits. `{name}`
+    is replaced with the secret's name; stdout is the value.
+
+    A command that fails, or prints nothing, is an error: a placeholder replaced
+    with an empty string would deploy a router with an empty key.
+    """
+    values: dict[str, str] = {}
+    for name in names:
+        check_secret_name(name)
+        proc = subprocess.run(
+            ["sh", "-c", template.replace("{name}", name)],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            raise ToolError(
+                f"--secret-command failed for '{name}' (exit {proc.returncode})"
+                + ("\n" + detail[0] if detail else ""))
+        value = proc.stdout.rstrip("\n")
+        if value == "":
+            raise ToolError(f"--secret-command produced no value for '{name}'")
+        values[name] = value
+    return values
+
+
 # --------------------------------------------------------------------------
 # transport
 # --------------------------------------------------------------------------
@@ -326,7 +355,12 @@ def cmd_list_secrets(args: argparse.Namespace) -> int:
     return 0
 
 
-def _secretize(script: str, secret_args: list[str], secrets_dir: str | None) -> tuple[str, list[str]]:
+def _secretize(
+    script: str,
+    secret_args: list[str],
+    secrets_dir: str | None,
+    secret_command: str | None = None,
+) -> tuple[str, list[str]]:
     with open(script, "r", encoding="utf-8") as handle:
         text = handle.read()
     names = find_placeholders(text)
@@ -343,15 +377,20 @@ def _secretize(script: str, secret_args: list[str], secrets_dir: str | None) -> 
         except OSError as exc:
             raise ToolError(f"cannot read secret '{name}' from {path}: {exc}") from exc
     missing = [n for n in names if n not in values]
+    if missing and secret_command:
+        # Only what is still unresolved: an explicit --secret or a file in
+        # --secrets-dir wins over asking the command.
+        values.update(read_secret_command(secret_command, missing))
+        missing = []
     if missing:
         raise ToolError(
             "unresolved secret placeholders: " + ", ".join(missing) +
-            "\npass them with --secret NAME=PATH (or --secrets-dir)")
+            "\npass them with --secret NAME=PATH, --secrets-dir, or --secret-command")
     return substitute(text, values), names
 
 
 def cmd_secretize(args: argparse.Namespace) -> int:
-    text, names = _secretize(args.script, args.secret, args.secrets_dir)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command)
     destination = args.output
     # 0600 from creation *and* afterwards: the mode passed to os.open applies
     # only when the file is created, so secretizing into a destination that
@@ -451,7 +490,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             "pass --yes to confirm")
 
     router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
-    text, names = _secretize(args.script, args.secret, args.secrets_dir)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command)
 
     if args.dry_run:
         print(f"would deploy {len(text)} bytes with {len(names)} secret(s) to "
@@ -572,6 +611,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", required=True)
     p.add_argument("--secret", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--secrets-dir", help="directory of files named after secrets")
+    p.add_argument("--secret-command", metavar="CMD",
+                   help="run CMD per unresolved secret ({name} substituted), "
+                        "using its stdout instead of reading files")
     p.set_defaults(func=cmd_secretize)
 
     p = sub.add_parser("deploy", help="secretize, upload, import and verify")
@@ -586,6 +628,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "needs this, or every deploy is a first contact)")
     p.add_argument("--secret", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--secrets-dir")
+    p.add_argument("--secret-command", metavar="CMD",
+                   help="run CMD per unresolved secret ({name} substituted), "
+                        "using its stdout instead of reading files")
     p.add_argument("--reset", action="store_true",
                    help="reset-configuration with the script (destructive)")
     p.add_argument("--yes", action="store_true", help="confirm --reset")
