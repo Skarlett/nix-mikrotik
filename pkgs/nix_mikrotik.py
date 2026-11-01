@@ -147,6 +147,51 @@ def read_secret_files(directory: str, names: list[str]) -> dict[str, str]:
     return values
 
 
+def read_sops_secrets(path: str, names: list[str], key_file: str | None) -> dict[str, str]:
+    """Decrypt this router's secrets out of a sops file, at deploy time.
+
+    The deploying host never holds the plaintext: the file is encrypted in the
+    store, and `sops -d --extract` is what turns one entry into one value, in
+    memory, in the deploy process. The key is the *host's own* sops key, so no
+    activation step is needed on the machine and nothing is staged to disk.
+
+    `key_file` sets `SOPS_AGE_KEY_FILE` for the subprocess; left unset, sops
+    finds its key the way it already does (that environment variable, or
+    `~/.config/sops/age/keys.txt`).
+    """
+    env = dict(os.environ)
+    if key_file is None and "SOPS_AGE_KEY_FILE" not in env:
+        # The host's own key if it has one -- sops-nix puts it here -- and
+        # otherwise nothing: sops falls back to the user's key
+        # (~/.config/sops/age/keys.txt), which is what an operator running this
+        # by hand has. Either way no activation step is needed on the machine.
+        host_key = "/var/lib/sops-nix/key.txt"
+        if os.path.exists(host_key):
+            key_file = host_key
+    if key_file is not None:
+        env["SOPS_AGE_KEY_FILE"] = key_file
+    values: dict[str, str] = {}
+    for name in names:
+        check_secret_name(name)
+        try:
+            proc = subprocess.run(
+                ["sops", "-d", path, "--extract", f'["{name}"]'],
+                capture_output=True, text=True, env=env)
+        except FileNotFoundError as exc:
+            raise ToolError(
+                "--sops-file needs sops on PATH (add pkgs.sops to the unit's path)") from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            raise ToolError(
+                f"sops could not read '{name}' from {path} (exit {proc.returncode})"
+                + ("\n" + detail[0] if detail else ""))
+        value = proc.stdout.rstrip("\n")
+        if value == "":
+            raise ToolError(f"sops returned no value for '{name}' in {path}")
+        values[name] = value
+    return values
+
+
 def read_secret_command(template: str, names: list[str]) -> dict[str, str]:
     """Resolve secrets by running a command per name, instead of reading files.
 
@@ -360,6 +405,8 @@ def _secretize(
     secret_args: list[str],
     secrets_dir: str | None,
     secret_command: str | None = None,
+    sops_file: str | None = None,
+    sops_key_file: str | None = None,
 ) -> tuple[str, list[str]]:
     with open(script, "r", encoding="utf-8") as handle:
         text = handle.read()
@@ -377,6 +424,9 @@ def _secretize(
         except OSError as exc:
             raise ToolError(f"cannot read secret '{name}' from {path}: {exc}") from exc
     missing = [n for n in names if n not in values]
+    if missing and sops_file:
+        values.update(read_sops_secrets(sops_file, missing, sops_key_file))
+        missing = []
     if missing and secret_command:
         # Only what is still unresolved: an explicit --secret or a file in
         # --secrets-dir wins over asking the command.
@@ -385,12 +435,12 @@ def _secretize(
     if missing:
         raise ToolError(
             "unresolved secret placeholders: " + ", ".join(missing) +
-            "\npass them with --secret NAME=PATH, --secrets-dir, or --secret-command")
+            "\npass them with --secret NAME=PATH, --secrets-dir, --sops-file or --secret-command")
     return substitute(text, values), names
 
 
 def cmd_secretize(args: argparse.Namespace) -> int:
-    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file)
     destination = args.output
     # 0600 from creation *and* afterwards: the mode passed to os.open applies
     # only when the file is created, so secretizing into a destination that
@@ -490,7 +540,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             "pass --yes to confirm")
 
     router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
-    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file)
 
     if args.dry_run:
         print(f"would deploy {len(text)} bytes with {len(names)} secret(s) to "
@@ -611,6 +661,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", required=True)
     p.add_argument("--secret", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--secrets-dir", help="directory of files named after secrets")
+    p.add_argument("--sops-file", metavar="PATH",
+                   help="decrypt the secrets out of this sops file, with the host's "
+                        "own sops key -- nothing has to be staged on the deploying machine")
+    p.add_argument("--sops-key-file", metavar="PATH",
+                   help="sops key to decrypt with (sets SOPS_AGE_KEY_FILE); default: "
+                        "sops' own discovery")
     p.add_argument("--secret-command", metavar="CMD",
                    help="run CMD per unresolved secret ({name} substituted), "
                         "using its stdout instead of reading files")
@@ -628,6 +684,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "needs this, or every deploy is a first contact)")
     p.add_argument("--secret", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--secrets-dir")
+    p.add_argument("--sops-file", metavar="PATH",
+                   help="decrypt the secrets out of this sops file, with the host's "
+                        "own sops key -- nothing has to be staged on the deploying machine")
+    p.add_argument("--sops-key-file", metavar="PATH",
+                   help="sops key to decrypt with (sets SOPS_AGE_KEY_FILE); default: "
+                        "sops' own discovery")
     p.add_argument("--secret-command", metavar="CMD",
                    help="run CMD per unresolved secret ({name} substituted), "
                         "using its stdout instead of reading files")
