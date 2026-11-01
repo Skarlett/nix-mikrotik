@@ -77,6 +77,54 @@ rec {
   # Evaluate and render in one step. `config` is what `evalMikrotik` returns.
   renderConfig = config: renderer.render config;
 
+  # The fleet form: every router declared under `mikrotik.routers`, rendered.
+  #
+  # Each entry is a *module*, not a value: a router is a configuration of its
+  # own, so it is evaluated on its own (and its own assertions run there) rather
+  # than being merged into the fleet's configuration. That is also what lets a
+  # clan service contribute one: a service instance holds a module, and two
+  # instances compose because `mikrotik.routers.<name>` is keyed by name.
+  #
+  # The single-router options are not rendered here -- a configuration that
+  # fills them in as well is refused by an assertion rather than silently
+  # producing a script the fleet does not name.
+  evalMikrotikFleet =
+    { modules
+    , specialArgs ? { }
+    }:
+    let
+      cfg = (evalMikrotik { inherit modules specialArgs; }).mikrotik;
+    in
+    lib.mapAttrs
+      (name: routerModule:
+      # The router's own assertions say "mikrotik.secrets", which in a fleet
+      # of twenty points at no router in particular; the context line is what
+      # makes the failure findable.
+      builtins.addErrorContext "while evaluating mikrotik.routers.${name}" (
+        renderer.render (evalMikrotik { modules = [ routerModule ]; inherit specialArgs; })
+      ))
+      cfg.routers;
+
+  # The fleet as derivations, one directory per router: `$out/<name>/router-config.rsc`.
+  mkRouterFleetScripts =
+    { pkgs
+    , modules
+    , specialArgs ? { }
+    }:
+    let
+      rendered = evalMikrotikFleet { inherit modules specialArgs; };
+    in
+    pkgs.runCommandLocal "mikrotik-fleet-scripts" { } (
+      lib.concatStringsSep "\n" (
+        lib.mapAttrsToList
+          (name: script: ''
+            mkdir -p $out/${name}
+            cp ${pkgs.writeText "${name}-config.rsc" script} $out/${name}/router-config.rsc
+          '')
+          rendered
+      )
+    );
+
   # A derivation holding router-config.rsc, so a build of the router's
   # configuration is a store path like any other.
   mkRouterScript =

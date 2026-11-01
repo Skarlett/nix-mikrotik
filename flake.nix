@@ -116,7 +116,7 @@
               example = evaluated.example;
             };
 
-# The typed menu options render what `sections` renders: one
+            # The typed menu options render what `sections` renders: one
             # configuration written both ways, byte-compared.
             menus = import ./tests/menus.nix {
               inherit pkgs lib;
@@ -159,6 +159,14 @@
               '';
               script = config.packages.mikrotik-chr-fixture-script;
               refusedScript = ./tests/fixtures/refused.rsc;
+            };
+
+            # Several routers in one configuration: they compose instead of
+            # colliding, each script keeps its own identity, and a refusal names
+            # the router that is wrong.
+            fleet = import ./tests/fleet.nix {
+              inherit pkgs;
+              inherit (mt) evalMikrotik evalMikrotikFleet evalMikrotikRaw mkSecret;
             };
           };
 
