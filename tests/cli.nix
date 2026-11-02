@@ -263,5 +263,55 @@ pkgs.runCommand "check-cli" { } ''
   print("--reset is refused before upload without --yes, and passes the guard with it")
   PY
 
+
+  # ------------------------------------------- secrets that are not files here --
+  # `--secret-command`: the value is fetched, not stored. A host that must not
+  # hold the router's keys passes a command (sops, clan vars, pass) and the
+  # plaintext exists only inside this process.
+  $cli secretize router.rsc -o cmd.rsc --secret-command 'printf %s "cmd-{name}"'
+  grep -q 'private-key=cmd-wg-private-key' cmd.rsc
+  grep -q 'passphrase=cmd-wifi-password' cmd.rsc
+
+  # A command that fails is a refusal, not an empty value.
+  if $cli secretize router.rsc -o cmd-bad.rsc --secret-command 'false'; then
+    echo "a failing --secret-command was accepted"; exit 1
+  fi
+  # ... and one that prints nothing is the same refusal.
+  if $cli secretize router.rsc -o cmd-empty.rsc --secret-command 'true'; then
+    echo "a silent --secret-command was accepted"; exit 1
+  fi
+
+  # An explicit --secret wins over the command: the cheap path does not need it.
+  printf 'explicit-value' > explicit
+  $cli secretize router.rsc -o explicit.rsc \
+    --secret wg-private-key=explicit --secret-command 'printf %s "cmd-{name}"'
+  grep -q 'private-key=explicit-value' explicit.rsc
+  grep -q 'passphrase=cmd-wifi-password' explicit.rsc
+
+  # `--sops-file`: the tool decrypts each entry itself. `sops` is stubbed here --
+  # the point under test is the argv and the substitution, not sops.
+  mkdir -p stub
+  # sops -d FILE --extract <pattern>; the stub prints the name it was asked for.
+  printf '%s\n' '#!/bin/sh' 'printf "sops-%s" "$(printf %s "$4" | tr -d "[]{}\\\"")"' > stub/sops
+  chmod +x stub/sops
+  PATH=$PWD/stub:$PATH $cli secretize router.rsc -o sops.rsc \
+    --sops-file secrets.yaml --sops-key-file /var/lib/sops-nix/key.txt
+  grep -q 'private-key=sops-wg-private-key' sops.rsc
+  grep -q 'passphrase=sops-wifi-password' sops.rsc
+
+  # ------------------------------------------------ generators: minted, once --
+  # `--secret-generator` creates a value that does not exist yet, and
+  # `--generator-state-dir` keeps it -- a generator that ran on every deploy
+  # would mint a second key and break the tunnel it was minting for.
+  $cli secretize router.rsc -o gen.rsc \
+    --secret-generator 'printf gen-{name}' --generator-state-dir gen-state
+  grep -q 'private-key=gen-wg-private-key' gen.rsc
+  [ "$(stat -c %a gen-state/wg-private-key)" = "600" ]
+
+  # The stored value is reused: the generator below would fail if it ran.
+  $cli secretize router.rsc -o gen2.rsc \
+    --secret-generator 'false' --generator-state-dir gen-state
+  grep -q 'private-key=gen-wg-private-key' gen2.rsc
+
   touch $out
 ''

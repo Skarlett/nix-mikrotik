@@ -192,6 +192,47 @@ def read_sops_secrets(path: str, names: list[str], key_file: str | None) -> dict
     return values
 
 
+def generate_secrets(template: str, names: list[str], state_dir: str | None) -> dict[str, str]:
+    """Mint values for secrets that do not exist yet, and keep them.
+
+    This is the "run the var generators" path: a host with no clan can ask for a
+    key to be created rather than read. `{name}` is substituted, stdout is the
+    value, and with `--generator-state-dir` the value is written there (0600) so
+    the *next* deploy reads it instead of minting a second key for the same
+    tunnel -- a generator that runs on every deploy would renumber every tunnel
+    it touches.
+
+    Anything already present in the state directory is read, not regenerated:
+    that is what makes the mint a one-time act.
+    """
+    values: dict[str, str] = {}
+    if state_dir is not None:
+        values.update(read_secret_files(state_dir, names))
+    for name in names:
+        if name in values:
+            continue
+        check_secret_name(name)
+        proc = subprocess.run(
+            ["sh", "-c", template.replace("{name}", name)],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            raise ToolError(
+                f"--secret-generator failed for '{name}' (exit {proc.returncode})"
+                + ("\n" + detail[0] if detail else ""))
+        value = proc.stdout.rstrip("\n")
+        if value == "":
+            raise ToolError(f"--secret-generator produced no value for '{name}'")
+        values[name] = value
+        if state_dir is not None:
+            os.makedirs(state_dir, exist_ok=True)
+            path = os.path.join(state_dir, name)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(value + "\n")
+    return values
+
+
 def read_secret_command(template: str, names: list[str]) -> dict[str, str]:
     """Resolve secrets by running a command per name, instead of reading files.
 
@@ -407,6 +448,8 @@ def _secretize(
     secret_command: str | None = None,
     sops_file: str | None = None,
     sops_key_file: str | None = None,
+    secret_generator: str | None = None,
+    generator_state_dir: str | None = None,
 ) -> tuple[str, list[str]]:
     with open(script, "r", encoding="utf-8") as handle:
         text = handle.read()
@@ -427,6 +470,9 @@ def _secretize(
     if missing and sops_file:
         values.update(read_sops_secrets(sops_file, missing, sops_key_file))
         missing = []
+    if missing and secret_generator:
+        values.update(generate_secrets(secret_generator, missing, generator_state_dir))
+        missing = []
     if missing and secret_command:
         # Only what is still unresolved: an explicit --secret or a file in
         # --secrets-dir wins over asking the command.
@@ -435,12 +481,12 @@ def _secretize(
     if missing:
         raise ToolError(
             "unresolved secret placeholders: " + ", ".join(missing) +
-            "\npass them with --secret NAME=PATH, --secrets-dir, --sops-file or --secret-command")
+            "\npass them with --secret NAME=PATH, --secrets-dir, --sops-file, --secret-generator or --secret-command")
     return substitute(text, values), names
 
 
 def cmd_secretize(args: argparse.Namespace) -> int:
-    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir)
     destination = args.output
     # 0600 from creation *and* afterwards: the mode passed to os.open applies
     # only when the file is created, so secretizing into a destination that
@@ -540,7 +586,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             "pass --yes to confirm")
 
     router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
-    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir)
 
     if args.dry_run:
         print(f"would deploy {len(text)} bytes with {len(names)} secret(s) to "
@@ -661,6 +707,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", required=True)
     p.add_argument("--secret", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--secrets-dir", help="directory of files named after secrets")
+    p.add_argument("--secret-generator", metavar="CMD",
+                   help="mint a value per missing secret ({name} substituted) -- "
+                        "run the generator, rather than read it")
+    p.add_argument("--generator-state-dir", metavar="DIR",
+                   help="where minted values are kept (0600), so the next deploy "
+                        "reads the key instead of minting a second one")
     p.add_argument("--sops-file", metavar="PATH",
                    help="decrypt the secrets out of this sops file, with the host's "
                         "own sops key -- nothing has to be staged on the deploying machine")
@@ -684,6 +736,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "needs this, or every deploy is a first contact)")
     p.add_argument("--secret", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--secrets-dir")
+    p.add_argument("--secret-generator", metavar="CMD",
+                   help="mint a value per missing secret ({name} substituted) -- "
+                        "run the generator, rather than read it")
+    p.add_argument("--generator-state-dir", metavar="DIR",
+                   help="where minted values are kept (0600), so the next deploy "
+                        "reads the key instead of minting a second one")
     p.add_argument("--sops-file", metavar="PATH",
                    help="decrypt the secrets out of this sops file, with the host's "
                         "own sops key -- nothing has to be staged on the deploying machine")
