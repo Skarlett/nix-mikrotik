@@ -41,11 +41,23 @@
       };
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [ (import ./modules/flake/routers.nix { inherit mt; }) ];
+
       systems = [ "x86_64-linux" "aarch64-linux" ];
+
+      # This repository's own routers/ convention, exercised on the examples:
+      # `examples/routers/<name>/configuration.nix` publishes
+      # `mikrotikConfigurations.<name>`, which is what a consumer gets without
+      # writing any wiring of its own.
+      mikrotik.routers.directory = ./examples/routers;
 
       flake = {
         # The module class itself.
         lib = mt;
+
+        # The `routers/` convention, for consumers that would rather keep one
+        # directory of routers than a table of modules.
+        flakeModules.routers = import ./modules/flake/routers.nix { inherit mt; };
 
         mikrotikModules = {
           base = ./modules/base.nix;
@@ -56,12 +68,10 @@
           menus = ./modules/menus.nix;
         };
 
-        mikrotikConfigurations = lib.mapAttrs
-          (_: config: {
-            inherit config;
-            script = mt.render config;
-          })
-          evaluated;
+        # `mikrotikConfigurations` is published by modules/flake/routers.nix,
+        # from `examples/routers/` -- the same convention a consumer uses. The
+        # `evaluated` set above stays for the checks, which assert on the
+        # evaluated config rather than the rendered script.
       };
 
       perSystem = { pkgs, config, ... }:
