@@ -289,6 +289,21 @@ pkgs.runCommand "check-cli" { } ''
   fi
   grep -q 'not a path under the vars directory' err-varfiles-esc
 
+  # clan's own store keeps a var in a directory: `secret` holds a secret,
+  # `value` a published one. So a deploy can be pointed at the per-machine tree
+  # and the placeholder name is the path -- no restatement of the layout.
+  mkdir -p varstore/per-machine/chr-1/wg-keys/wg.layer
+  printf 'clan-key' > varstore/per-machine/chr-1/wg-keys/wg.layer/secret
+  printf 'clan-pub' > varstore/per-machine/chr-1/wg-keys/wg.layer/value
+  cat > clanlayout.rsc <<'EOF'
+  /interface wireguard
+  set name=wg.layer private-key=__MIKROTIK_SECRET_wg-keys/wg.layer__
+  EOF
+  $cli secretize clanlayout.rsc -o clanlayout.out \
+    --secrets-dir varstore/per-machine/chr-1
+  grep -q 'private-key=clan-key' clanlayout.out
+  ! grep -q '__MIKROTIK_SECRET_' clanlayout.out
+
   # ---------------------------------------------------------------- names ----
   # The name is also the file name the value is read from, so a name that is not
   # one is refused. This is the half modules/base.nix asserts at build time, for

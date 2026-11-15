@@ -195,6 +195,16 @@ def read_secret_files(
             raise ToolError(
                 f"varFiles path '{rel}' resolves outside --secrets-dir {directory}")
         if not os.path.isfile(path):
+            # clan's own store: a var is a *directory* that holds `secret` for a
+            # secret and `value` for a published one
+            # (`vars/per-machine/<machine>/<generator>/<file>/secret`). Point
+            # `--secrets-dir` at the tree and the placeholder name is the path.
+            for leaf in ("secret", "value"):
+                candidate = os.path.join(path, leaf)
+                if os.path.isfile(candidate):
+                    path = candidate
+                    break
+        if not os.path.isfile(path):
             continue
         with open(path, "r", encoding="utf-8") as handle:
             values[name] = handle.read().strip()
