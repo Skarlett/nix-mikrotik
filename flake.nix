@@ -43,9 +43,24 @@
         modules = [ ./tests/fixtures/chr-configuration.nix ];
         inherit pkgs;
       };
+
+      # Inside `perSystem` neither `config` nor `self'` is the flake-level view
+      # -- `config` is the per-system module's config and `self'` is the flake
+      # cut down to one system -- so the names `routers.nix` published are
+      # handed down as a module argument. A separate module rather than a
+      # `perSystem._module.args` line next to `perSystem` itself: two
+      # definitions of `perSystem` in one module would have to merge, and one
+      # of them is a function.
+      routerNamesModule = { config, lib, ... }: {
+        perSystem._module.args.routerNames =
+          lib.sort lib.lessThan (lib.attrNames config.flake.mikrotikConfigurations);
+      };
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
-      imports = [ (import ./modules/flake/routers.nix { inherit mt; }) ];
+      imports = [
+        (import ./modules/flake/routers.nix { inherit mt; })
+        routerNamesModule
+      ];
 
       systems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -87,11 +102,26 @@
         # evaluated config rather than the rendered script.
       };
 
-      perSystem = { pkgs, config, ... }:
+      perSystem = { pkgs, config, routerNames, ... }:
         let
           chr = pkgs.callPackage ./chr { };
           evaluated = evaluatedFor pkgs;
           chrFixture = chrFixtureFor pkgs;
+
+          # Every router `mikrotik.routers.directory` published, in name order.
+          # `nix run .#generate -- --state-dir ./vars` is then the one command
+          # that mints the values of a whole `routers/` directory: the manifests
+          # are store paths passed to one `nix-mikrotik generate` call, so the
+          # tool sees them all and a shared generator runs once.
+          #
+          # `routerNames` is handed in from the flake module (see
+          # `perSystem._module.args` below) because neither `config` nor `self'`
+          # inside `perSystem` is the flake-level view: `config` is the
+          # per-system config and `self'` is the flake cut down to one system,
+          # so `mikrotikConfigurations` is not on either.
+          routerManifests = map
+            (name: config.packages."mikrotik-${name}-generators")
+            routerNames;
         in
         {
           # One script derivation per example, per system: `nix build
@@ -113,6 +143,30 @@
               name = "chr-fixture";
               config = chrFixture;
             };
+            # The same configuration's generators, as the manifest the tool
+            # reads: `checks.chr-deploy` mints the router's key from this
+            # instead of being handed one, which is the path a consumer takes.
+            mikrotik-chr-fixture-generators = pkgs.writeText "chr-fixture-generators.json"
+              (builtins.toJSON (mt.manifest chrFixture.config));
+            # The `routers/` convention as one command. Each router publishes its
+            # own manifest; this passes all of them to one `generate` call, so
+            # the tool runs the generators in dependency order across the
+            # directory instead of per router, and a generator two routers share
+            # is minted once.
+            mikrotik-generate = pkgs.writeShellApplication {
+              name = "mikrotik-generate";
+              runtimeInputs = [ config.packages.nix-mikrotik ];
+              text = ''
+                manifests=${toString (builtins.length routerManifests)}
+                if [ "$manifests" -eq 0 ]; then
+                  echo "mikrotik-generate: no routers under mikrotik.routers.directory" >&2
+                  exit 2
+                fi
+                exec nix-mikrotik generate ${lib.concatStringsSep " " (map toString routerManifests)} "$@"
+              '';
+              meta.description =
+                "Generate the vars every router under mikrotik.routers.directory declares";
+            };
             default = chr.lab;
           };
 
@@ -121,6 +175,13 @@
               type = "app";
               program = lib.getExe config.packages.chr-lab;
               meta.description = "Boot two MikroTik CHR VMs on a point-to-point link";
+            };
+            # `nix run .#generate -- --state-dir ./vars`, and the same app with
+            # `--prompt NAME=VALUE` for a generator that asks something.
+            generate = {
+              type = "app";
+              program = lib.getExe config.packages.mikrotik-generate;
+              meta.description = "Run every router's secret generators into a state directory";
             };
             nix-mikrotik = {
               type = "app";
@@ -163,6 +224,39 @@
               };
             };
 
+            # `nix run .#generate` against the example `routers/` directory: one
+            # command mints a whole fleet's vars, and it has to reach *every*
+            # router -- a routers/ that silently generated for one of two is the
+            # failure this check exists for.
+            routers-generate = pkgs.runCommand "check-routers-generate" { } ''
+              set -eu
+              mkdir -p "$out"
+              generate=${config.packages.mikrotik-generate}/bin/mikrotik-generate
+
+              "$generate" --state-dir "$out/state" > "$out/first.txt"
+              # One value per router, filed under its key in `mikrotik.routers`
+              # -- not its hostname -- in clan's `per-machine` layout.
+              grep -qx 'example-wg-key/privkey' "$out/first.txt"
+              grep -qx 'legacy-key/privkey' "$out/first.txt"
+              example_key="$out/state/per-machine/example/example-wg-key/privkey"
+              legacy_key="$out/state/per-machine/legacy/legacy-key/privkey"
+              [ -f "$example_key" ]
+              [ -f "$legacy_key" ]
+              [ "$(stat -c %a "$example_key")" = "400" ]
+              # `wg genkey` output: 32 bytes of base64, so 44 characters and a
+              # newline. A generator that quietly wrote nothing would leave an
+              # empty file here and still exit 0.
+              [ "$(wc -c < "$example_key")" = "45" ]
+              [ "$(wc -c < "$legacy_key")" = "45" ]
+
+              # Running it again reads what it minted: a second key would break
+              # the tunnel the first one already opened.
+              cp "$example_key" "$out/before"
+              "$generate" --state-dir "$out/state" > "$out/second.txt"
+              grep -qx 'example-wg-key/privkey' "$out/second.txt"
+              cmp "$out/before" "$example_key"
+            '';
+
             # The CLI's secret handling: placeholders listed, substituted with
             # the quoting RouterOS needs, and refused when a value or a name is
             # unusable -- plus the claim its failure message is allowed to make.
@@ -197,6 +291,7 @@
                 patchShebangs $out/bin
               '';
               script = config.packages.mikrotik-chr-fixture-script;
+              generators = config.packages.mikrotik-chr-fixture-generators;
               refusedScript = ./tests/fixtures/refused.rsc;
             };
 

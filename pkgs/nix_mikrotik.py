@@ -36,6 +36,7 @@ device reports neither of them through ssh's exit status:
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -99,6 +100,31 @@ def check_secret_name(name: str) -> str:
     return name
 
 
+def check_var_path(path: str) -> str:
+    """A `varFiles` path: where a generated file sits under the vars directory.
+
+    Clan's own spelling -- `per-machine/<machine>/<generator>/<file>`,
+    `shared/<generator>/<file>`, `per-export/<export>/<generator>/<file>` -- so
+    this is several segments, not the one slash a placeholder name has. It is
+    still a *relative* path joined to `--secrets-dir`, so `..`, `.` and an
+    absolute path are refused: they are how a manifest would read a file outside
+    the directory the operator pointed at.
+    """
+    segments = path.split("/")
+    if (
+        path.startswith("/")
+        or not path
+        or any(segment in ("", ".", "..") for segment in segments)
+        or any(SECRET_PART_RE.fullmatch(segment) is None for segment in segments)
+    ):
+        raise ToolError(
+            f"varFiles path '{path}' is not a path under the vars directory: "
+            "expected clan's layout, `per-machine/<machine>/<generator>/<file>` "
+            "or `shared/<generator>/<file>` -- relative, no '..', no absolute "
+            f"path, each segment matching {SECRET_PART_RE.pattern}")
+    return path
+
+
 def routeros_value(value: str) -> str:
     """A secret value, spelled the way RouterOS needs it in the slot it goes in.
 
@@ -147,22 +173,27 @@ def read_secret_files(
 ) -> dict[str, str]:
     """Values read out of `--secrets-dir`, keyed by placeholder name.
 
-    `files` renames a placeholder on its way to disk: the manifest's `varFiles`
-    maps a name a cell uses to the path the value actually sits at, which is what
-    a clan machine generator needs (`<generator>/<file>` under the per-machine
-    directory). Without an entry the name is the path, which is the older,
-    flatter convention and what most configurations want.
+    `files` maps a placeholder name to the path its value actually sits at: the
+    manifest's `varFiles` carries clan's own layout for a generated file
+    (`per-machine/<machine>/<generator>/<file>`, `shared/<generator>/<file>`),
+    relative to the vars directory. Without an entry the name is the path, which
+    is the flatter convention a configuration of its own generators wants.
     """
     files = files or {}
     values: dict[str, str] = {}
+    root = os.path.realpath(directory) if directory else ""
     for name in names:
         # Belt and braces: the name is a path component, and every caller has
         # already validated it, but this is the line that would read a file
         # outside the directory if one ever did not.
         check_secret_name(name)
-        rel = files.get(name, name)
-        check_secret_name(rel)
+        rel = check_var_path(files.get(name, name))
         path = os.path.join(directory, rel)
+        # `..` is refused above, and this is the second lock on the same door:
+        # a path that resolves outside the directory is not read at all.
+        if root and not os.path.realpath(path).startswith(root + os.sep):
+            raise ToolError(
+                f"varFiles path '{rel}' resolves outside --secrets-dir {directory}")
         if not os.path.isfile(path):
             continue
         with open(path, "r", encoding="utf-8") as handle:
@@ -263,14 +294,16 @@ def load_manifest(path: str) -> tuple[list[dict], dict[str, str]]:
     read from `--secrets-dir`, never both:
 
         { "generators": [ …the list load_generator_manifest validates… ]
-        , "varFiles": { "mesh-chr1-private-key": { "file": "lab-peers/chr1"
-                                                  , "description": "…" } } }
+        , "varFiles": { "mesh-chr1-private-key": { "path": "per-machine/flagship/mikrotik-lab-peers/chr1"
+                                                , "description": "…" } } }
 
-    `varFiles` maps a *placeholder name* to the path under `--secrets-dir`. The
-    file is optional in the manifest: nix leaves `file` null when a consumer did
-    not set one, and this applies the default (the key), so a bare list of
-    generators -- the older shape, which fixtures and hand-written manifests
-    still use -- reads as "nothing to read from disk beyond the names".
+    `varFiles` maps a *placeholder name* to the path under `--secrets-dir`, and
+    the path is clan's own layout for a generated file -- the directory clan
+    files the generator in (`per-machine/<machine>/<generator>`, or
+    `shared/<generator>`) plus the file name. The path is optional in the
+    manifest: a bare list of generators -- the older shape, which fixtures and
+    hand-written manifests still use -- reads as "the placeholder name is the
+    file name", and `file` is accepted as the older spelling of `path`.
     """
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -304,13 +337,12 @@ def load_manifest(path: str) -> tuple[list[dict], dict[str, str]]:
             entry = {}
         if not isinstance(entry, dict):
             raise ToolError(f"{path}: varFiles entry '{name}' must be an object")
-        file = entry.get("file")
+        file = entry.get("path", entry.get("file"))
         if file is None:
             file = name
         elif not isinstance(file, str) or not file:
-            raise ToolError(f"{path}: varFiles entry '{name}' has a file that is not a path")
-        check_secret_name(file)
-        var_files[name] = file
+            raise ToolError(f"{path}: varFiles entry '{name}' has a path that is not a string")
+        var_files[name] = check_var_path(file)
     return generators, var_files
 
 
@@ -356,9 +388,27 @@ def validate_generators(path: str, data: list) -> list[dict]:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
                 raise ToolError(f"generator '{name}' has a file with no name")
             check_secret_name(f"{name}/{entry['name']}")
+            mode = entry.get("mode")
+            if mode is not None and not re.fullmatch(r"[0-7]{4}", str(mode)):
+                raise ToolError(
+                    f"generator '{name}' file '{entry['name']}' has a mode that is "
+                    f"not a 4-digit octal number: {mode!r}")
         inputs = gen.get("runtimeInputs") or []
         if not isinstance(inputs, list) or not all(isinstance(i, str) for i in inputs):
             raise ToolError(f"generator '{name}' has runtimeInputs that are not paths")
+        dependencies = gen.get("dependencies") or []
+        if not isinstance(dependencies, list) or not all(isinstance(d, str) for d in dependencies):
+            raise ToolError(f"generator '{name}' has dependencies that are not names")
+        prompts = gen.get("prompts") or []
+        if not isinstance(prompts, list):
+            raise ToolError(f"generator '{name}' has prompts that are not a list")
+        for prompt in prompts:
+            if not isinstance(prompt, dict) or not isinstance(prompt.get("name"), str):
+                raise ToolError(f"generator '{name}' has a prompt with no name")
+            check_secret_name(prompt["name"])
+            if "/" in prompt["name"]:
+                raise ToolError(
+                    f"generator '{name}' prompt '{prompt['name']}' must not contain '/'")
     return data
 
 
@@ -394,11 +444,65 @@ def generator_dir(state_dir: str, gen: dict, entry: dict) -> str:
     return os.path.dirname(generator_file(state_dir, gen, entry))
 
 
+def generator_paths(state_dir: str, gen: dict) -> dict[str, str]:
+    """Every file of a generator, by name, whether or not it exists yet."""
+    return {
+        entry["name"]: generator_file(state_dir, gen, entry)
+        for entry in gen["files"]
+    }
+
+
+# clan keeps each generator's invalidation hash in a dot-file inside the
+# generator's own directory (`VALIDATION_HASH_NAME` in
+# `clan_lib/vars/_types.py`), so a state directory can be read by clan and by
+# this tool without a translation table. The hash is what makes `validation`
+# mean anything: a file on disk is not enough if the *definition* of the
+# generator changed.
+VALIDATION_HASH_NAME = ".validation-hash"
+
+
+def validation_hash_file(state_dir: str, gen: dict) -> str:
+    return os.path.join(generator_dir(state_dir, gen, gen["files"][0]), VALIDATION_HASH_NAME)
+
+
+def stored_validation(state_dir: str, gen: dict) -> str | None:
+    path = validation_hash_file(state_dir, gen)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read().strip()
+
+
+def validation_is_valid(state_dir: str, gen: dict) -> bool:
+    """clan's rule: unset on both sides is valid, otherwise they must match."""
+    target = gen.get("validationHash")
+    stored = stored_validation(state_dir, gen)
+    if target is None and stored is None:
+        return True
+    return stored == target
+
+
+def write_validation(state_dir: str, gen: dict) -> None:
+    path = validation_hash_file(state_dir, gen)
+    target = gen.get("validationHash")
+    if target is None:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(target + "\n")
+
+
 def read_generated(state_dir: str, gen: dict) -> dict[str, str]:
-    """The secret half of an already-generated generator, keyed `<name>/<file>`."""
+    """The secret half of an already-generated generator, keyed `<name>/<file>`.
+
+    A file declared `deploy = false` is an intermediate that only another
+    generator reads, so it is not part of the set a menu cell may substitute.
+    """
     values: dict[str, str] = {}
     for entry in gen["files"]:
-        if not entry.get("secret", True):
+        if not entry.get("secret", True) or not entry.get("deploy", True):
             continue
         path = generator_file(state_dir, gen, entry)
         if not os.path.isfile(path):
@@ -408,22 +512,94 @@ def read_generated(state_dir: str, gen: dict) -> dict[str, str]:
     return values
 
 
+def read_prompt_previous(state_dir: str, gen: dict, prompt: dict) -> str | None:
+    """A persisted prompt's previous value, read from the file it becomes.
+
+    `prompts.<name>.persist = true` makes the prompt a file of the generator --
+    the Nix module does the same -- so the first run's answer is what a later
+    run reads instead of asking again.
+    """
+    if not prompt.get("persist"):
+        return None
+    for entry in gen["files"]:
+        if entry["name"] == prompt["name"]:
+            path = generator_file(state_dir, gen, entry)
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    return handle.read()
+    return None
+
+
+def ask_prompt(prompt: dict) -> str:
+    """Ask for a prompt on the terminal. Only called when stdin is a TTY."""
+    label = prompt.get("description") or prompt["name"]
+    kind = prompt.get("type") or "line"
+    if kind == "hidden":
+        return getpass.getpass(f"{label}: ")
+    sys.stderr.write(f"{label}: ")
+    sys.stderr.flush()
+    if kind in ("multiline", "multiline-hidden"):
+        return sys.stdin.read().rstrip("\n")
+    return sys.stdin.readline().rstrip("\n")
+
+
+def resolve_prompts(
+    state_dir: str,
+    gen: dict,
+    supplied: dict[str, str],
+    interactive: bool = True,
+) -> dict[str, str]:
+    """Every prompt's value: supplied, remembered, or asked on a terminal."""
+    resolved: dict[str, str] = {}
+    unanswered: list[str] = []
+    for prompt in gen.get("prompts") or []:
+        name = prompt["name"]
+        if name in supplied:
+            resolved[name] = supplied[name]
+            continue
+        previous = read_prompt_previous(state_dir, gen, prompt)
+        if previous is not None:
+            resolved[name] = previous
+            continue
+        if interactive and sys.stdin.isatty():
+            resolved[name] = ask_prompt(prompt)
+            continue
+        unanswered.append(name)
+    if unanswered:
+        raise ToolError(
+            f"generator '{gen['name']}' needs a value for prompt "
+            f"{', '.join(repr(n) for n in unanswered)}: pass "
+            "--prompt NAME=VALUE, put the name in --prompts-dir, or run it on a "
+            "terminal")
+    return resolved
+
+
 def run_generators(
     manifest: str | list[dict],
     state_dir: str | None,
+    prompts: dict[str, str] | None = None,
+    dry_run: bool = False,
 ) -> tuple[dict[str, str], list[str]]:
     """Run the generators that have not run yet: secret values, published paths.
 
     This is the declarative half of `--secret-generator`: instead of one command
     per secret name, the configuration says which script produces which files,
-    and this runs it once. A generator whose files all exist is *read*, never
-    re-run -- running a key generator on every deploy would renumber every
-    tunnel it touches, and the peer that already has the old key would go on
-    using it.
+    and this runs it once. A generator whose files all exist *and* whose
+    validation hash still matches is *read*, never re-run -- running a key
+    generator on every deploy would renumber every tunnel it touches, and the
+    peer that already has the old key would go on using it.
+
+    A generator whose `validation` changed is re-run, the way clan re-runs one:
+    the hash is the definition's fingerprint, and a file that exists is not
+    evidence that it is still the right file.
 
     A generator with only some of its files present is a hard error rather than
     a re-run, for the same reason: the files it did write are the half that
     something else already depends on.
+
+    `dry_run` reports what would be minted without minting it, and never deletes
+    anything: `deploy --dry-run` must not hand out keys or destroy the ones a
+    half-finished state directory still holds.
     """
     gens = load_generator_manifest(manifest) if isinstance(manifest, str) else manifest
     if not gens:
@@ -436,42 +612,70 @@ def run_generators(
             "--generators needs --generator-state-dir: generated values have to "
             "be kept somewhere, or the next deploy mints a second key for the "
             "same tunnel")
+    supplied = prompts or {}
     values: dict[str, str] = {}
     published: list[str] = []
+    # What every generator so far wrote: the `$in` tree of the next one is built
+    # from it, which is why the manifest has to arrive in dependency order.
+    produced: dict[str, dict[str, str]] = {}
     for gen in gens:
         name = gen["name"]
-        present = [
-            entry["name"] for entry in gen["files"]
-            if os.path.isfile(generator_file(state_dir, gen, entry))
-        ]
-        declared = [entry["name"] for entry in gen["files"]]
-        if len(present) == len(declared):
+        paths = generator_paths(state_dir, gen)
+        declared = list(paths)
+        present = [file for file in declared if os.path.isfile(paths[file])]
+        complete = len(present) == len(declared)
+        if complete and validation_is_valid(state_dir, gen):
             values.update(read_generated(state_dir, gen))
             published.extend(
-                generator_file(state_dir, gen, entry)
-                for entry in gen["files"] if not entry.get("secret", True)
+                paths[entry["name"]] for entry in gen["files"]
+                if not entry.get("secret", True) and entry.get("deploy", True)
             )
+            produced[name] = paths
             continue
-        if present:
+        if present and not complete:
             missing = sorted(set(declared) - set(present))
             # The whole set goes, not the missing half: a generator's files are
             # one value in several spellings (a private key and its public key),
             # so keeping the survivors would keep peers pointed at a key whose
             # private half is about to be replaced.
-            for entry in gen["files"]:
-                shutil.rmtree(generator_dir(state_dir, gen, entry), ignore_errors=True)
+            if not dry_run:
+                for directory in {os.path.dirname(path) for path in paths.values()}:
+                    shutil.rmtree(directory, ignore_errors=True)
             raise ToolError(
                 f"generator '{name}' is half-generated under {state_dir} (missing: "
                 f"{', '.join(missing)}); its remaining files were removed so the "
                 "next run starts a complete set -- the peers using the old ones "
                 "need the new public key")
-        fresh, fresh_published = run_generator(state_dir, gen)
+        if dry_run:
+            # Report the names that a real run would mint, and nothing else: a
+            # dry run that ran the generator would be a dry run with a side
+            # effect, which is the one thing it must not have.
+            for entry in gen["files"]:
+                if entry.get("secret", True) and entry.get("deploy", True):
+                    values[f"{name}/{entry['name']}"] = ""
+            produced[name] = paths
+            continue
+        unknown = [d for d in gen.get("dependencies") or [] if d not in produced]
+        if unknown:
+            raise ToolError(
+                f"generator '{name}' depends on {', '.join(unknown)}, which this "
+                "manifest does not declare before it")
+        inputs = {d: produced[d] for d in gen.get("dependencies") or []}
+        resolved = resolve_prompts(state_dir, gen, supplied)
+        fresh, fresh_published = run_generator(state_dir, gen, prompts=resolved, inputs=inputs)
+        write_validation(state_dir, gen)
         values.update(fresh)
         published.extend(fresh_published)
+        produced[name] = paths
     return values, published
 
 
-def run_generator(state_dir: str, gen: dict) -> tuple[dict[str, str], list[str]]:
+def run_generator(
+    state_dir: str,
+    gen: dict,
+    prompts: dict[str, str] | None = None,
+    inputs: dict[str, dict[str, str]] | None = None,
+) -> tuple[dict[str, str], list[str]]:
     """Run one generator's script and keep what it wrote under `$out`."""
     name = gen["name"]
     workdir = tempfile.mkdtemp(prefix=f"nix-mikrotik-{name}-")
@@ -480,6 +684,38 @@ def run_generator(state_dir: str, gen: dict) -> tuple[dict[str, str], list[str]]
         os.makedirs(out, mode=0o700)
         env = dict(os.environ)
         env["out"] = out
+
+        # `$in/<generator>/<file>` is how one generator reads another's output
+        # (clan's own contract). The tree is a copy inside the work directory, so
+        # a script cannot write back into the state directory through it.
+        indir = os.path.join(workdir, "in")
+        os.makedirs(indir, mode=0o700)
+        env["in"] = indir
+        for dep, files in (inputs or {}).items():
+            depdir = os.path.join(indir, dep)
+            os.makedirs(depdir, mode=0o700)
+            for filename, source in files.items():
+                if not os.path.isfile(source):
+                    raise ToolError(
+                        f"generator '{name}' depends on {dep}/{filename}, which is "
+                        "not in the state directory")
+                destination = os.path.join(depdir, filename)
+                shutil.copyfile(source, destination)
+                os.chmod(destination, 0o400)
+
+        # `$prompts/<name>` is a file per prompt, not an environment variable:
+        # a value may contain a newline or a quote, and both belong in a file.
+        if gen.get("prompts"):
+            promptsdir = os.path.join(workdir, "prompts")
+            os.makedirs(promptsdir, mode=0o700)
+            env["prompts"] = promptsdir
+            given = prompts or {}
+            for prompt in gen["prompts"]:
+                path = os.path.join(promptsdir, prompt["name"])
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o400)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(given[prompt["name"]])
+
         # The tool's own PATH is not the generator's: `runtimeInputs` is what the
         # configuration says the script needs, and it comes first so a package
         # named there wins over whatever the deploying host happens to have.
@@ -506,22 +742,33 @@ def run_generator(state_dir: str, gen: dict) -> tuple[dict[str, str], list[str]]
         published: list[str] = []
         for entry in gen["files"]:
             secret = entry.get("secret", True)
+            deploy = entry.get("deploy", True)
             destination = generator_file(state_dir, gen, entry)
             os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
+            # A re-run replaces files that are 0400/0444 -- copyfile would fail
+            # to open one for writing, and a generated file is replaced, never
+            # edited in place.
+            if os.path.lexists(destination):
+                os.remove(destination)
             shutil.copyfile(os.path.join(out, entry["name"]), destination)
-            # A generated secret is as sensitive as one that was read from a
-            # clan var; a published one is meant to be read by everyone.
-            # clan's modes: a var is 0400 and world-unreadable, a value another
-            # machine has to read is 0444. Nothing here is writable, because a
-            # generated file is a fact about a key that already has a peer --
-            # editing one in place would leave the peer holding a stale copy.
-            os.chmod(destination, 0o400 if secret else 0o444)
             if secret:
-                with open(destination, "r", encoding="utf-8") as handle:
-                    values[f"{name}/{entry['name']}"] = handle.read().strip()
-            else:
+                # A generated secret is as sensitive as one read from a clan
+                # var. Its mode comes from the manifest (default 0400), because
+                # a generator that has to hand a key to a service on the
+                # deploying machine is a real case clan supports.
+                os.chmod(destination, int(str(entry.get("mode") or "0400"), 8))
+                if deploy:
+                    with open(destination, "r", encoding="utf-8") as handle:
+                        values[f"{name}/{entry['name']}"] = handle.read().strip()
+            elif deploy:
+                # Published: another machine has to read it. Never writable, so
+                # a peer cannot be handed a copy that later disagrees with the
+                # generator's own.
+                os.chmod(destination, 0o444)
                 published.append(destination)
-                print(f"published {destination}", file=sys.stderr)
+            else:
+                # An intermediate: another generator reads it, nothing else.
+                os.chmod(destination, 0o400)
         return values, published
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -745,6 +992,8 @@ def _secretize(
     secret_generator: str | None = None,
     generator_state_dir: str | None = None,
     generators: str | None = None,
+    prompts: dict[str, str] | None = None,
+    dry_run: bool = False,
 ) -> tuple[str, list[str]]:
     with open(script, "r", encoding="utf-8") as handle:
         text = handle.read()
@@ -773,7 +1022,9 @@ def _secretize(
         # Before the per-name generator: the manifest says which script mints
         # which files, so it is the one that can mint a value *and* the public
         # key that has to be handed to the peer.
-        values.update(run_generators(generator_list, generator_state_dir)[0])
+        values.update(run_generators(
+            generator_list, generator_state_dir,
+            prompts=prompts, dry_run=dry_run)[0])
         missing = [n for n in names if n not in values]
     if missing and secret_generator:
         values.update(generate_secrets(secret_generator, missing, generator_state_dir))
@@ -799,8 +1050,47 @@ def _secretize(
     return substitute(text, values), names
 
 
+def prompt_values(args: argparse.Namespace) -> dict[str, str]:
+    """Prompt values from the command line: a directory of files, then `--prompt`.
+
+    A directory is the shape a deploy unit can be handed (one file per prompt,
+    named after it), and `--prompt` is what a person types. The flag wins over
+    the directory, so an operator can override one value without rewriting it.
+    """
+    values: dict[str, str] = {}
+    directory = getattr(args, "prompts_dir", None)
+    if directory:
+        if not os.path.isdir(directory):
+            raise ToolError(f"--prompts-dir: {directory} is not a directory")
+        for entry in sorted(os.listdir(directory)):
+            path = os.path.join(directory, entry)
+            if not os.path.isfile(path):
+                continue
+            check_secret_name(entry)
+            with open(path, "r", encoding="utf-8") as handle:
+                values[entry] = handle.read().rstrip("\n")
+    for item in getattr(args, "prompt", None) or []:
+        name, sep, value = item.partition("=")
+        if not sep or not name:
+            raise ToolError(f"--prompt wants NAME=VALUE, got {item!r}")
+        check_secret_name(name)
+        values[name] = value
+    return values
+
+
 def cmd_generate(args: argparse.Namespace) -> int:
-    values, published = run_generators(args.manifest, args.state_dir)
+    values: dict[str, str] = {}
+    published: list[str] = []
+    prompts = prompt_values(args)
+    # One manifest per router, and a router's values are keyed
+    # `<generator>/<file>` -- so two routers that each declare `wg/privkey` are
+    # two state-directory paths but one key here. Generating them in one call is
+    # therefore fine (the values are written, not substituted); a deploy still
+    # takes its own router's manifest alone.
+    for manifest in args.manifests:
+        fresh, fresh_published = run_generators(manifest, args.state_dir, prompts=prompts)
+        values.update(fresh)
+        published.extend(fresh_published)
     for name in sorted(values):
         print(name)
     for path in published:
@@ -813,7 +1103,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
 
 
 def cmd_secretize(args: argparse.Namespace) -> int:
-    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir, args.generators)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir, args.generators, prompt_values(args))
     destination = args.output
     # 0600 from creation *and* afterwards: the mode passed to os.open applies
     # only when the file is created, so secretizing into a destination that
@@ -913,7 +1203,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             "pass --yes to confirm")
 
     router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
-    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir, args.generators)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir, args.generators, prompt_values(args), args.dry_run)
 
     if args.dry_run:
         print(f"would deploy {len(text)} bytes with {len(names)} secret(s) to "
@@ -1012,6 +1302,22 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------
 
+def add_prompt_arguments(parser: argparse.ArgumentParser) -> None:
+    """The two ways a prompt's value gets in without a terminal.
+
+    `--prompt` is what a person types; `--prompts-dir` is the shape a deploy
+    unit can be handed (one file per prompt, named after it, so the value never
+    appears in a process list). With neither, a run that still needs an answer
+    asks on the terminal -- and a run that is not on a terminal fails, rather
+    than writing an empty value into a key.
+    """
+    parser.add_argument("--prompt", action="append", default=[], metavar="NAME=VALUE",
+                        help="answer a generator prompt (repeatable)")
+    parser.add_argument("--prompts-dir", metavar="DIR",
+                        help="directory of files named after prompts, one value each")
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nix-mikrotik",
@@ -1030,12 +1336,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_list_secrets)
 
     p = sub.add_parser("generate", help="run a configuration's secret generators")
-    p.add_argument("manifest", help="generator manifest JSON (a flake's mikrotik-<name>-generators)")
+    p.add_argument("manifests", nargs="+", metavar="MANIFEST",
+                   help="generator manifest JSON (a flake's mikrotik-<name>-generators); "
+                        "one per router, so `nix-mikrotik generate $(nix build "
+                        "--print-out-paths .#mikrotik-*-generators)` generates the vars "
+                        "of every router in a routers/ directory")
     p.add_argument("--state-dir", required=True, metavar="DIR",
                    help="where generated values are kept, in clan's layout: each "
                         "file goes to the relDir the manifest gives it "
                         "(per-machine/<router>/<generator>/, shared/<generator>/), "
-                        "0400 for a secret and 0444 for a published value")
+                        "at the mode the manifest declares (0400 for a secret, "
+                        "0444 for a published value)")
+    add_prompt_arguments(p)
     p.set_defaults(func=cmd_generate)
 
     p = sub.add_parser("secretize", help="substitute secret values into a copy")
@@ -1063,6 +1375,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--secret-command", metavar="CMD",
                    help="run CMD per unresolved secret ({name} substituted), "
                         "using its stdout instead of reading files")
+    add_prompt_arguments(p)
     p.set_defaults(func=cmd_secretize)
 
     p = sub.add_parser("deploy", help="secretize, upload, import and verify")
@@ -1106,6 +1419,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="read the identity back after deploying")
     p.add_argument("--expect-hostname", help="fail if the identity differs")
     p.add_argument("--dry-run", action="store_true")
+    add_prompt_arguments(p)
     p.set_defaults(func=cmd_deploy)
 
     p = sub.add_parser("diff", help="diff the live config against a script")

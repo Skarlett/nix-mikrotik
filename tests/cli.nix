@@ -238,7 +238,7 @@ pkgs.runCommand "check-cli" { } ''
     "generators": [],
     "varFiles": {
       "mesh-chr1-private-key": {
-        "file": "mikrotik-lab-peers/chr1",
+        "path": "per-machine/chr-1/mikrotik-lab-peers/chr1",
         "description": "chr1's tunnel key, minted on the controller"
       }
     }
@@ -251,7 +251,7 @@ pkgs.runCommand "check-cli" { } ''
   mkdir -p vars/per-machine/chr-1/mikrotik-lab-peers
   printf 'mesh-key' > vars/per-machine/chr-1/mikrotik-lab-peers/chr1
   $cli secretize handoff.rsc -o handoff-out.rsc \
-    --secrets-dir vars/per-machine/chr-1 --generators handoff-generators.json
+    --secrets-dir vars --generators handoff-generators.json
   grep -q 'private-key=mesh-key' handoff-out.rsc
   ! grep -q '__MIKROTIK_SECRET_' handoff-out.rsc
 
@@ -269,7 +269,7 @@ pkgs.runCommand "check-cli" { } ''
   # next thing the operator does is go and put the file there.
   rm vars/per-machine/chr-1/mikrotik-lab-peers/chr1
   if $cli secretize handoff.rsc -o missing-out.rsc \
-    --secrets-dir vars/per-machine/chr-1 --generators handoff-generators.json 2>err-handoff-missing; then
+    --secrets-dir vars --generators handoff-generators.json 2>err-handoff-missing; then
     echo "secretize substituted a hand-off whose file does not exist" >&2
     exit 1
   fi
@@ -280,14 +280,14 @@ pkgs.runCommand "check-cli" { } ''
   # A varFiles path that would walk out of --secrets-dir is refused where it is
   # declared, not joined onto the directory.
   cat > escape-varfiles.json <<'EOF'
-  { "generators": [], "varFiles": { "mesh-chr1-private-key": { "file": "../outside" } } }
+  { "generators": [], "varFiles": { "mesh-chr1-private-key": { "path": "per-machine/../../outside" } } }
   EOF
   if $cli secretize handoff.rsc -o escape-out.rsc \
-    --secrets-dir vars/per-machine/chr-1 --generators escape-varfiles.json 2>err-varfiles-esc; then
+    --secrets-dir vars --generators escape-varfiles.json 2>err-varfiles-esc; then
     echo "secretize accepted a varFiles path outside --secrets-dir" >&2
     exit 1
   fi
-  grep -q 'not usable as a file name' err-varfiles-esc
+  grep -q 'not a path under the vars directory' err-varfiles-esc
 
   # ---------------------------------------------------------------- names ----
   # The name is also the file name the value is read from, so a name that is not
@@ -511,6 +511,286 @@ pkgs.runCommand "check-cli" { } ''
   $cli secretize router.rsc -o gen2.rsc \
     --secret-generator 'false' --generator-state-dir gen-state
   grep -q 'private-key=gen-wg-private-key' gen2.rsc
+
+  # ---------------------------- generators: the clan interface, end to end ----
+  # A generator is a script plus the files it declares, and `generate` is what
+  # runs it once and keeps what it wrote. The cases below are the parts of
+  # clan's interface that a port gets subtly wrong: the layout of the state
+  # directory, `$in`, prompts, the validation hash, and the two flags a file
+  # carries (`deploy` and `mode`).
+  mkdir -p man
+
+  cat > man/wg.json <<'JSON'
+  [
+    {
+      "name": "wg-key",
+      "files": [
+        { "name": "privkey", "secret": true, "relDir": "per-machine/r1/wg-key" },
+        { "name": "pubkey", "secret": false, "relDir": "per-machine/r1/wg-key" },
+        { "name": "seed", "secret": false, "deploy": false, "relDir": "per-machine/r1/wg-key" }
+      ],
+      "runtimeInputs": [],
+      "script": "printf 'priv-A\\n' > $out/privkey; printf 'pub-A\\n' > $out/pubkey; printf 'seed-A\\n' > $out/seed"
+    }
+  ]
+  JSON
+
+  $cli generate man/wg.json --state-dir st1 > generated
+  grep -qx 'wg-key/privkey' generated
+  # The public half is offered as a path, not a value: it is meant to be handed
+  # to a peer, and the peer reads it off a machine that already has the state.
+  grep -q '^published st1/per-machine/r1/wg-key/pubkey$' generated
+  if grep -q 'seed' generated; then
+    echo "an intermediate (deploy=false) was offered as a value"; exit 1
+  fi
+  [ "$(cat st1/per-machine/r1/wg-key/privkey)" = "priv-A" ]
+  [ "$(cat st1/per-machine/r1/wg-key/pubkey)" = "pub-A" ]
+  [ "$(stat -c %a st1/per-machine/r1/wg-key/privkey)" = "400" ]
+  [ "$(stat -c %a st1/per-machine/r1/wg-key/pubkey)" = "444" ]
+  [ "$(stat -c %a st1/per-machine/r1/wg-key/seed)" = "400" ]
+
+  # The second run reads what the first wrote: the script below would fail, and
+  # a generator that re-ran on every deploy would mint a second key for a tunnel
+  # whose peer already has the first.
+  cat > man/wg-dead.json <<'JSON'
+  [
+    {
+      "name": "wg-key",
+      "files": [
+        { "name": "privkey", "secret": true, "relDir": "per-machine/r1/wg-key" },
+        { "name": "pubkey", "secret": false, "relDir": "per-machine/r1/wg-key" },
+        { "name": "seed", "secret": false, "deploy": false, "relDir": "per-machine/r1/wg-key" }
+      ],
+      "runtimeInputs": [],
+      "script": "exit 1"
+    }
+  ]
+  JSON
+  $cli generate man/wg-dead.json --state-dir st1 > generated-again
+  grep -qx 'wg-key/privkey' generated-again
+  [ "$(cat st1/per-machine/r1/wg-key/privkey)" = "priv-A" ]
+
+  # `$in/<generator>/<file>` is how one generator reads another's output.
+  cat > man/peer.json <<'JSON'
+  [
+    {
+      "name": "wg-key",
+      "files": [
+        { "name": "privkey", "secret": true, "relDir": "per-machine/r1/wg-key" },
+        { "name": "pubkey", "secret": false, "relDir": "per-machine/r1/wg-key" },
+        { "name": "seed", "secret": false, "deploy": false, "relDir": "per-machine/r1/wg-key" }
+      ],
+      "runtimeInputs": [],
+      "script": "printf 'priv-A\\n' > $out/privkey; printf 'pub-A\\n' > $out/pubkey; printf 'seed-A\\n' > $out/seed"
+    },
+    {
+      "name": "peer",
+      "dependencies": [ "wg-key" ],
+      "files": [
+        { "name": "psk", "secret": true, "relDir": "per-machine/r1/peer" }
+      ],
+      "runtimeInputs": [],
+      "script": "printf 'psk-of-%s\\n' \"$(cat $in/wg-key/pubkey)\" > $out/psk"
+    }
+  ]
+  JSON
+  $cli generate man/peer.json --state-dir st-in > generated-peer
+  grep -qx 'peer/psk' generated-peer
+  [ "$(cat st-in/per-machine/r1/peer/psk)" = "psk-of-pub-A" ]
+
+  # The dependency has to be declared *before* the generator that reads it: the
+  # manifest is the order, so the tool never has to sort a graph.
+  cat > man/peer-first.json <<'JSON'
+  [
+    {
+      "name": "peer",
+      "dependencies": [ "wg-key" ],
+      "files": [
+        { "name": "psk", "secret": true, "relDir": "per-machine/r1/peer" }
+      ],
+      "runtimeInputs": [],
+      "script": "printf 'psk-of-%s\\n' \"$(cat $in/wg-key/pubkey)\" > $out/psk"
+    },
+    {
+      "name": "wg-key",
+      "files": [
+        { "name": "privkey", "secret": true, "relDir": "per-machine/r1/wg-key" },
+        { "name": "pubkey", "secret": false, "relDir": "per-machine/r1/wg-key" },
+        { "name": "seed", "secret": false, "deploy": false, "relDir": "per-machine/r1/wg-key" }
+      ],
+      "runtimeInputs": [],
+      "script": "printf 'priv-A\\n' > $out/privkey; printf 'pub-A\\n' > $out/pubkey; printf 'seed-A\\n' > $out/seed"
+    }
+  ]
+  JSON
+  if $cli generate man/peer-first.json --state-dir st-order 2> err-order; then
+    echo "a generator whose dependency is declared after it was accepted"; exit 1
+  fi
+  grep -q 'depends on wg-key, which this manifest does not declare before it' err-order
+
+  # `$in` is a copy: a script that writes to it cannot reach back into the state
+  # directory and change a value another generator already published.
+  cat > man/tamper.json <<'JSON'
+  [
+    {
+      "name": "wg-key",
+      "files": [
+        { "name": "privkey", "secret": true, "relDir": "per-machine/r1/wg-key" },
+        { "name": "pubkey", "secret": false, "relDir": "per-machine/r1/wg-key" },
+        { "name": "seed", "secret": false, "deploy": false, "relDir": "per-machine/r1/wg-key" }
+      ],
+      "runtimeInputs": [],
+      "script": "printf 'priv-A\\n' > $out/privkey; printf 'pub-A\\n' > $out/pubkey; printf 'seed-A\\n' > $out/seed"
+    },
+    {
+      "name": "snoop",
+      "dependencies": [ "wg-key" ],
+      "files": [
+        { "name": "seen", "secret": true, "deploy": false, "relDir": "per-machine/r1/snoop" }
+      ],
+      "runtimeInputs": [],
+      "script": "chmod 600 $in/wg-key/pubkey; printf 'tampered' > $in/wg-key/pubkey; cat $in/wg-key/pubkey > $out/seen"
+    }
+  ]
+  JSON
+  $cli generate man/tamper.json --state-dir st-in > /dev/null
+  [ "$(cat st-in/per-machine/r1/wg-key/pubkey)" = "pub-A" ]
+  [ "$(cat st-in/per-machine/r1/snoop/seen)" = "tampered" ]
+
+  # Prompts: a value a human knows and the machine cannot mint.
+  cat > man/ask.json <<'JSON'
+  [
+    {
+      "name": "psk2",
+      "files": [
+        { "name": "passphrase", "secret": true, "relDir": "per-machine/r1/psk2" }
+      ],
+      "prompts": [
+        { "name": "passphrase", "description": "tunnel passphrase", "persist": true }
+      ],
+      "runtimeInputs": [],
+      "script": "cat $prompts/passphrase > $out/passphrase"
+    }
+  ]
+  JSON
+
+  # No answer and no terminal is a refusal naming all three ways in -- never an
+  # empty value written into a key.
+  if $cli generate man/ask.json --state-dir st-ask 2> err-ask; then
+    echo "a prompt with no value was accepted"; exit 1
+  fi
+  grep -q -- '--prompt NAME=VALUE' err-ask
+  grep -q -- '--prompts-dir' err-ask
+  grep -q 'terminal' err-ask
+  [ ! -e st-ask/per-machine/r1/psk2/passphrase ]
+
+  $cli generate man/ask.json --state-dir st-ask --prompt passphrase=hunter2 > /dev/null
+  [ "$(cat st-ask/per-machine/r1/psk2/passphrase)" = "hunter2" ]
+
+  mkdir -p prompts
+  printf 'from-dir' > prompts/passphrase
+  $cli generate man/ask.json --state-dir st-dir --prompts-dir prompts > /dev/null
+  [ "$(cat st-dir/per-machine/r1/psk2/passphrase)" = "from-dir" ]
+
+  # `--prompt` wins over the directory, so one value can be overridden without
+  # rewriting the directory a deploy unit was handed.
+  $cli generate man/ask.json --state-dir st-both --prompts-dir prompts \
+    --prompt passphrase=cli-wins > /dev/null
+  [ "$(cat st-both/per-machine/r1/psk2/passphrase)" = "cli-wins" ]
+
+  # A changed validation hash re-runs the generator -- and a persisted prompt
+  # answers it from the value the first run wrote, without asking again.
+  cat > man/ask2.json <<'JSON'
+  [
+    {
+      "name": "psk2",
+      "files": [
+        { "name": "passphrase", "secret": true, "relDir": "per-machine/r1/psk2" }
+      ],
+      "prompts": [
+        { "name": "passphrase", "description": "tunnel passphrase", "persist": true }
+      ],
+      "validation": "test -n yes",
+      "validationHash": "def456",
+      "runtimeInputs": [],
+      "script": "printf '%s-v2\\n' \"$(cat $prompts/passphrase)\" > $out/passphrase"
+    }
+  ]
+  JSON
+  $cli generate man/ask2.json --state-dir st-ask > /dev/null
+  [ "$(cat st-ask/per-machine/r1/psk2/passphrase)" = "hunter2-v2" ]
+
+  # The control: same hash, a script that would fail -- read, not re-run. The
+  # hash is the definition's fingerprint, and a file that exists is not evidence
+  # that it is still the file the definition describes.
+  cat > man/ask2-dead.json <<'JSON'
+  [
+    {
+      "name": "psk2",
+      "files": [
+        { "name": "passphrase", "secret": true, "relDir": "per-machine/r1/psk2" }
+      ],
+      "prompts": [
+        { "name": "passphrase", "description": "tunnel passphrase", "persist": true }
+      ],
+      "validation": "test -n yes",
+      "validationHash": "def456",
+      "runtimeInputs": [],
+      "script": "exit 1"
+    }
+  ]
+  JSON
+  $cli generate man/ask2-dead.json --state-dir st-ask > /dev/null
+  [ "$(cat st-ask/per-machine/r1/psk2/passphrase)" = "hunter2-v2" ]
+
+  # `mode` and `deploy`: a generated secret can be handed to a service on the
+  # deploying machine (0440), and a file that only another generator reads is
+  # not part of the set a menu cell may substitute.
+  cat > man/carrier.json <<'JSON'
+  [
+    {
+      "name": "creds",
+      "files": [
+        { "name": "token", "secret": true, "deploy": false, "relDir": "per-machine/r1/creds" },
+        { "name": "svc", "secret": true, "mode": "0440", "relDir": "per-machine/r1/creds" },
+        { "name": "apikey", "secret": true, "relDir": "per-machine/r1/creds" }
+      ],
+      "runtimeInputs": [],
+      "script": "echo tok > $out/token; echo svc > $out/svc; echo api > $out/apikey"
+    }
+  ]
+  JSON
+  $cli generate man/carrier.json --state-dir st-carrier > carrier
+  grep -qx 'creds/svc' carrier
+  grep -qx 'creds/apikey' carrier
+  if grep -q 'creds/token' carrier; then
+    echo "an intermediate was offered as a value"; exit 1
+  fi
+  [ "$(stat -c %a st-carrier/per-machine/r1/creds/token)" = "400" ]
+  [ "$(stat -c %a st-carrier/per-machine/r1/creds/svc)" = "440" ]
+  [ "$(stat -c %a st-carrier/per-machine/r1/creds/apikey)" = "400" ]
+
+  printf '%s\n' '/interface wireguard' \
+    'set name=wg.gen private-key=__MIKROTIK_SECRET_creds/svc__' > carrier-ok.rsc
+  $cli secretize carrier-ok.rsc -o carrier-ok.out \
+    --generators man/carrier.json --generator-state-dir st-carrier
+  grep -q 'private-key=svc' carrier-ok.out
+
+  # An intermediate is another generator's input, never a script's value.
+  printf '%s\n' '/interface wireguard' \
+    'set name=wg.gen private-key=__MIKROTIK_SECRET_creds/token__' > carrier-bad.rsc
+  if $cli secretize carrier-bad.rsc -o carrier-bad.out \
+       --generators man/carrier.json --generator-state-dir st-carrier 2> err-carrier; then
+    echo "an intermediate was substituted into a script"; exit 1
+  fi
+  grep -q 'unresolved secret placeholders: creds/token' err-carrier
+
+  # A manifest with nowhere to keep what it mints is refused: the next deploy
+  # would mint a second key for the same tunnel.
+  if $cli secretize carrier-ok.rsc -o nope.out --generators man/carrier.json 2> err-nostate; then
+    echo "--generators without --generator-state-dir was accepted"; exit 1
+  fi
+  grep -q 'needs --generator-state-dir' err-nostate
 
   touch $out
 ''
