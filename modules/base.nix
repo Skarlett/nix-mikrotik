@@ -103,22 +103,40 @@ let
     # in a `mkSecret` call, which is silent unless the name is known in advance.
     varFiles = mkOption {
       type = types.attrsOf (types.submodule {
-        options.description = mkOption {
-          type = types.nullOr types.str;
-          default = null;
-          description = "What the value is, for generated documentation.";
+        options = {
+          description = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = "What the value is, for generated documentation.";
+          };
+          file = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = ''
+              Where the value sits under `--secrets-dir`, as
+              `<generator>/<file>` or just `<file>`. Defaults to the attribute
+              name.
+
+              The placeholder is the attribute name, so this is the one place a
+              cell's name and the file it comes from can differ -- which is what
+              a value minted by a clan machine generator needs, since clan files
+              it under `per-machine/<machine>/<generator>/<file>`.
+            '';
+          };
         };
       });
       default = { };
       example = literalExpression ''
-        { "mesh-chr1-private-key".description = "chr1's key, minted on the controller"; }
+        { "mesh-chr1-private-key".file = "mikrotik-lab-peers/chr1"; }
       '';
       description = ''
         Secret values that are not produced by this router's own generators,
         keyed by the name a menu cell references with `mkSecret`.
 
-        The attribute name is both the placeholder name and the file name under
-        the deploy tool's `--secrets-dir`, because the tool joins them directly.
+        The attribute name is the placeholder name a cell uses. By default it is
+        also the file name under the deploy tool's `--secrets-dir`; set `file`
+        when the value lives under a generator's directory instead.
+
         Prefer a `clan.core.vars.generators` declaration whenever the value can
         be minted at deploy time; this option is for a key another host already
         owns, such as a router's WireGuard key generated on its controller.

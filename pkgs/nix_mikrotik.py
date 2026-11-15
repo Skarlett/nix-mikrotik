@@ -140,14 +140,29 @@ def substitute(text: str, values: dict[str, str]) -> str:
     return PLACEHOLDER_RE.sub(repl, text)
 
 
-def read_secret_files(directory: str, names: list[str]) -> dict[str, str]:
+def read_secret_files(
+    directory: str,
+    names: list[str],
+    files: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Values read out of `--secrets-dir`, keyed by placeholder name.
+
+    `files` renames a placeholder on its way to disk: the manifest's `varFiles`
+    maps a name a cell uses to the path the value actually sits at, which is what
+    a clan machine generator needs (`<generator>/<file>` under the per-machine
+    directory). Without an entry the name is the path, which is the older,
+    flatter convention and what most configurations want.
+    """
+    files = files or {}
     values: dict[str, str] = {}
     for name in names:
         # Belt and braces: the name is a path component, and every caller has
         # already validated it, but this is the line that would read a file
         # outside the directory if one ever did not.
         check_secret_name(name)
-        path = os.path.join(directory, name)
+        rel = files.get(name, name)
+        check_secret_name(rel)
+        path = os.path.join(directory, rel)
         if not os.path.isfile(path):
             continue
         with open(path, "r", encoding="utf-8") as handle:
@@ -241,8 +256,71 @@ def generate_secrets(template: str, names: list[str], state_dir: str | None) -> 
     return values
 
 
+def load_manifest(path: str) -> tuple[list[dict], dict[str, str]]:
+    """Read the manifest `lib.manifest` renders, or a flake's `<name>-generators`.
+
+    Two documents in one file, because a placeholder is either minted here or
+    read from `--secrets-dir`, never both:
+
+        { "generators": [ …the list load_generator_manifest validates… ]
+        , "varFiles": { "mesh-chr1-private-key": { "file": "lab-peers/chr1"
+                                                  , "description": "…" } } }
+
+    `varFiles` maps a *placeholder name* to the path under `--secrets-dir`. The
+    file is optional in the manifest: nix leaves `file` null when a consumer did
+    not set one, and this applies the default (the key), so a bare list of
+    generators -- the older shape, which fixtures and hand-written manifests
+    still use -- reads as "nothing to read from disk beyond the names".
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        raise ToolError(f"cannot read the generator manifest {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"{path} is not a generator manifest: {exc}") from exc
+
+    if isinstance(data, list):
+        return validate_generators(path, data), {}
+
+    if not isinstance(data, dict):
+        raise ToolError(
+            f"{path} is not a generator manifest: expected a list of generators "
+            f"or an object with a 'generators' key, got {type(data).__name__}")
+
+    if "generators" not in data:
+        raise ToolError(f"{path} is not a generator manifest: it has no 'generators' key")
+    generators = validate_generators(path, data["generators"])
+
+    declared = data.get("varFiles") or {}
+    if not isinstance(declared, dict):
+        raise ToolError(
+            f"{path}: 'varFiles' must be an object keyed by placeholder name, "
+            f"got {type(declared).__name__}")
+    var_files: dict[str, str] = {}
+    for name, entry in declared.items():
+        check_secret_name(name)
+        if entry is None:
+            entry = {}
+        if not isinstance(entry, dict):
+            raise ToolError(f"{path}: varFiles entry '{name}' must be an object")
+        file = entry.get("file")
+        if file is None:
+            file = name
+        elif not isinstance(file, str) or not file:
+            raise ToolError(f"{path}: varFiles entry '{name}' has a file that is not a path")
+        check_secret_name(file)
+        var_files[name] = file
+    return generators, var_files
+
+
 def load_generator_manifest(path: str) -> list[dict]:
-    """Read the manifest `lib.generators` renders, or a flake's `<name>-generators`.
+    """The generators alone, for callers that do not resolve `varFiles`."""
+    return load_manifest(path)[0]
+
+
+def validate_generators(path: str, data: list) -> list[dict]:
+    """Check a generator list from the manifest `lib.generators` renders.
 
     The shape is the one `secrets.<name>` has in nix, minus everything the tool
     has no use for:
@@ -256,13 +334,6 @@ def load_generator_manifest(path: str) -> list[dict]:
     A list, not an attrset: the order is the order the generators were declared
     in, and one generator's script may read what an earlier one published.
     """
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except OSError as exc:
-        raise ToolError(f"cannot read the generator manifest {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise ToolError(f"{path} is not a generator manifest: {exc}") from exc
     if not isinstance(data, list):
         raise ToolError(
             f"{path} is not a generator manifest: expected a list of generators, "
@@ -337,7 +408,10 @@ def read_generated(state_dir: str, gen: dict) -> dict[str, str]:
     return values
 
 
-def run_generators(manifest: str, state_dir: str | None) -> tuple[dict[str, str], list[str]]:
+def run_generators(
+    manifest: str | list[dict],
+    state_dir: str | None,
+) -> tuple[dict[str, str], list[str]]:
     """Run the generators that have not run yet: secret values, published paths.
 
     This is the declarative half of `--secret-generator`: instead of one command
@@ -351,6 +425,12 @@ def run_generators(manifest: str, state_dir: str | None) -> tuple[dict[str, str]
     a re-run, for the same reason: the files it did write are the half that
     something else already depends on.
     """
+    gens = load_generator_manifest(manifest) if isinstance(manifest, str) else manifest
+    if not gens:
+        # A manifest that declares no generators -- a router whose values are all
+        # hand-offs, or a flake publishing an empty list -- has nothing to mint
+        # and so needs nowhere to keep it.
+        return {}, []
     if not state_dir:
         raise ToolError(
             "--generators needs --generator-state-dir: generated values have to "
@@ -358,7 +438,7 @@ def run_generators(manifest: str, state_dir: str | None) -> tuple[dict[str, str]
             "same tunnel")
     values: dict[str, str] = {}
     published: list[str] = []
-    for gen in load_generator_manifest(manifest):
+    for gen in gens:
         name = gen["name"]
         present = [
             entry["name"] for entry in gen["files"]
@@ -670,8 +750,12 @@ def _secretize(
         text = handle.read()
     names = find_placeholders(text)
     values: dict[str, str] = {}
+    # Read before anything else: the manifest says where a hand-off value sits
+    # under --secrets-dir, and reading the directory without it would only find
+    # the values whose placeholder happens to be the file name.
+    generator_list, var_files = load_manifest(generators) if generators else ([], {})
     if secrets_dir:
-        values.update(read_secret_files(secrets_dir, names))
+        values.update(read_secret_files(secrets_dir, names, var_files))
     for item in secret_args:
         if "=" not in item:
             raise ToolError(f"--secret wants NAME=PATH, got '{item}'")
@@ -689,7 +773,7 @@ def _secretize(
         # Before the per-name generator: the manifest says which script mints
         # which files, so it is the one that can mint a value *and* the public
         # key that has to be handed to the peer.
-        values.update(run_generators(generators, generator_state_dir)[0])
+        values.update(run_generators(generator_list, generator_state_dir)[0])
         missing = [n for n in names if n not in values]
     if missing and secret_generator:
         values.update(generate_secrets(secret_generator, missing, generator_state_dir))
@@ -700,10 +784,18 @@ def _secretize(
         values.update(read_secret_command(secret_command, missing))
         missing = []
     if missing:
-        raise ToolError(
-            "unresolved secret placeholders: " + ", ".join(missing) +
-            "\npass them with --secret NAME=PATH, --secrets-dir, --sops-file, "
-            "--generators, --secret-generator or --secret-command")
+        lines = ["unresolved secret placeholders: " + ", ".join(missing)]
+        for name in missing:
+            if name in var_files:
+                where = os.path.join(secrets_dir, var_files[name]) if secrets_dir else var_files[name]
+                lines.append(
+                    f"  '{name}' is declared under mikrotik.varFiles: it is minted "
+                    f"elsewhere, so it has to be found at {where}")
+        if not all(name in var_files for name in missing):
+            lines.append(
+                "pass them with --secret NAME=PATH, --secrets-dir, --sops-file, "
+                "--generators, --secret-generator or --secret-command")
+        raise ToolError("\n".join(lines))
     return substitute(text, values), names
 
 
@@ -966,7 +1058,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--generators", metavar="PATH",
                    help="generator manifest JSON (a flake's mikrotik-<name>-generators): "
                         "run the generators that have not run yet, then substitute "
-                        "their files; needs --generator-state-dir")
+                        "their files; values declared under varFiles are read from "
+                        "--secrets-dir instead")
     p.add_argument("--secret-command", metavar="CMD",
                    help="run CMD per unresolved secret ({name} substituted), "
                         "using its stdout instead of reading files")
@@ -999,7 +1092,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--generators", metavar="PATH",
                    help="generator manifest JSON (a flake's mikrotik-<name>-generators): "
                         "run the generators that have not run yet, then substitute "
-                        "their files; needs --generator-state-dir")
+                        "their files; values declared under varFiles are read from "
+                        "--secrets-dir instead")
     p.add_argument("--secret-command", metavar="CMD",
                    help="run CMD per unresolved secret ({name} substituted), "
                         "using its stdout instead of reading files")

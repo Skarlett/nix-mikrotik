@@ -1,4 +1,4 @@
-{ pkgs, evalMikrotik, evalMikrotikRaw, generators }:
+{ pkgs, evalMikrotik, evalMikrotikRaw, generators, manifest }:
 
 # The class refuses what it says it refuses.
 #
@@ -198,6 +198,26 @@ let
   varFileConfig = evalMikrotik { inherit pkgs; modules = [ varFileModule ]; };
   varFileDeclared = builtins.attrNames varFileConfig.mikrotik.varFiles;
   varFileGenerated = generators varFileConfig;
+  # The manifest is the document the tool reads: the generators to run, and the
+  # hand-offs to read from `--secrets-dir`. A hand-off with no `file` is the key
+  # itself, and the manifest says so by leaving it null rather than by repeating
+  # the key -- "no file given" and "this file" are different answers.
+  varFileManifest = manifest varFileConfig;
+  varFilePath = varFileManifest.varFiles."mesh-chr1-private-key".file;
+  # ... and one that names a file says where the value sits, which is how a clan
+  # generator's `per-machine/<machine>/<generator>/<file>` gets addressed.
+  varFileNamedModule = { mkSecret, ... }: {
+    mikrotik = {
+      hostname = "router2";
+      varFiles."mesh-chr1-private-key".file = "mikrotik-lab-peers/chr1";
+      sections."/interface wireguard" = [
+        { name = "wg0"; private-key = mkSecret "mesh-chr1-private-key"; }
+      ];
+    };
+  };
+  varFileNamedPath =
+    (manifest (evalMikrotik { inherit pkgs; modules = [ varFileNamedModule ]; }))
+    .varFiles."mesh-chr1-private-key".file;
   # ... and it is still a placeholder a typo cannot slip past.
   varFileTypoRefused = refused [
     ({ mkSecret, ... }: {
@@ -290,7 +310,19 @@ pkgs.runCommand "check-eval" { } ''
     echo "a typo against varFiles was not refused" >&2
     exit 1
   }
-  printf 'varFiles | declared | %s, no generator, typo refused\n' ${lib.escapeShellArg (lib.concatStringsSep "," varFileDeclared)} >> $out/refusals.txt
+  # The default is null, not the key: the tool applies the default, and a
+  # manifest that pre-filled it could not say whether a file was named.
+  [ ${if varFilePath == null then "0" else "1"} -eq 0 ] || {
+    echo "an unnamed varFiles file did not render as null: ${toString varFilePath}" >&2
+    exit 1
+  }
+  [ ${lib.escapeShellArg varFileNamedPath} = 'mikrotik-lab-peers/chr1' ] || {
+    echo "a named varFiles file did not reach the manifest: ${varFileNamedPath}" >&2
+    exit 1
+  }
+  printf 'varFiles | declared | %s, no generator, file default null, named file %s, typo refused\n' \
+    ${lib.escapeShellArg (lib.concatStringsSep "," varFileDeclared)} \
+    ${lib.escapeShellArg varFileNamedPath} >> $out/refusals.txt
 
   # -- every assertion fires, with a diagnostic that names the fix ----------
   ${lib.concatMapStrings (r: ''

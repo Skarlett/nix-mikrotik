@@ -224,6 +224,71 @@ pkgs.runCommand "check-cli" { } ''
   grep -q 'not inside the state directory' err-esc
   [ ! -e outside/privkey ]
 
+  # --------------------------------------------- values minted elsewhere ----
+  # A value the configuration does not mint is declared, not generated: the
+  # manifest carries a `varFiles` map from the placeholder name to the path the
+  # value sits at under --secrets-dir, and the tool reads it from there. This is
+  # the shape a controller-minted WireGuard key arrives in -- its file is under a
+  # clan generator's directory, so the name and the path differ.
+  #
+  # The manifest is an object rather than a bare list when `varFiles` is
+  # involved, and `generators` is still a list, so both forms have to read.
+  cat > handoff-generators.json <<'EOF'
+  {
+    "generators": [],
+    "varFiles": {
+      "mesh-chr1-private-key": {
+        "file": "mikrotik-lab-peers/chr1",
+        "description": "chr1's tunnel key, minted on the controller"
+      }
+    }
+  }
+  EOF
+  cat > handoff.rsc <<'EOF'
+  /interface wireguard
+  set name=wg.mesh private-key=__MIKROTIK_SECRET_mesh-chr1-private-key__
+  EOF
+  mkdir -p vars/per-machine/chr-1/mikrotik-lab-peers
+  printf 'mesh-key' > vars/per-machine/chr-1/mikrotik-lab-peers/chr1
+  $cli secretize handoff.rsc -o handoff-out.rsc \
+    --secrets-dir vars/per-machine/chr-1 --generators handoff-generators.json
+  grep -q 'private-key=mesh-key' handoff-out.rsc
+  ! grep -q '__MIKROTIK_SECRET_' handoff-out.rsc
+
+  # `generate` reads the same manifest: an object with no generators is an
+  # answer, not a parse error.
+  if $cli generate handoff-generators.json --state-dir handoff-state 2>err-handoff; then
+    :
+  else
+    echo "generate rejected a manifest with a varFiles section" >&2
+    cat err-handoff >&2
+    exit 1
+  fi
+
+  # A hand-off whose file is not there names the path it looked at, because the
+  # next thing the operator does is go and put the file there.
+  rm vars/per-machine/chr-1/mikrotik-lab-peers/chr1
+  if $cli secretize handoff.rsc -o missing-out.rsc \
+    --secrets-dir vars/per-machine/chr-1 --generators handoff-generators.json 2>err-handoff-missing; then
+    echo "secretize substituted a hand-off whose file does not exist" >&2
+    exit 1
+  fi
+  grep -q 'mikrotik.varFiles' err-handoff-missing
+  grep -q 'mikrotik-lab-peers/chr1' err-handoff-missing
+  [ ! -e missing-out.rsc ]
+
+  # A varFiles path that would walk out of --secrets-dir is refused where it is
+  # declared, not joined onto the directory.
+  cat > escape-varfiles.json <<'EOF'
+  { "generators": [], "varFiles": { "mesh-chr1-private-key": { "file": "../outside" } } }
+  EOF
+  if $cli secretize handoff.rsc -o escape-out.rsc \
+    --secrets-dir vars/per-machine/chr-1 --generators escape-varfiles.json 2>err-varfiles-esc; then
+    echo "secretize accepted a varFiles path outside --secrets-dir" >&2
+    exit 1
+  fi
+  grep -q 'not usable as a file name' err-varfiles-esc
+
   # ---------------------------------------------------------------- names ----
   # The name is also the file name the value is read from, so a name that is not
   # one is refused. This is the half modules/base.nix asserts at build time, for

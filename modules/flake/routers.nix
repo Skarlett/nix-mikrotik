@@ -75,6 +75,8 @@ let
     (_: router: {
       script = mt.renderConfig router;
       generators = mt.generators router;
+      varFiles = mt.varFiles router;
+      manifest = mt.manifest router;
     })
     (evaluated // fromServices);
 in
@@ -146,10 +148,11 @@ in
           (name: router: lib.nameValuePair "mikrotik-${name}" (pkgs.writeTextDir "router-config.rsc" router.script))
           rendered
         // lib.mapAttrs'
-          # The manifest `nix-mikrotik generate` and `--generators` read. A
-          # package rather than a string so a deploy unit can name it like any
-          # other path, and so `nix build .#mikrotik-<name>-generators` prints it.
-          (name: router: lib.nameValuePair "mikrotik-${name}-generators" (pkgs.writeText "${name}-generators.json" (builtins.toJSON router.generators)))
+          # The manifest `nix-mikrotik generate` and `--generators` read: what it
+          # can mint, and what it has to read from `--secrets-dir`. A package
+          # rather than a string so a deploy unit can name it like any other
+          # path, and so `nix build .#mikrotik-<name>-generators` prints it.
+          (name: router: lib.nameValuePair "mikrotik-${name}-generators" (pkgs.writeText "${name}-generators.json" (builtins.toJSON router.manifest)))
           rendered;
       };
     })

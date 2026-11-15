@@ -157,6 +157,30 @@ rec {
       })
       order;
 
+  # The values a configuration expects from elsewhere, as data the deploy tool
+  # reads alongside the generators:
+  #
+  #   { "mesh-chr1-private-key" = { file = "mikrotik-lab-peers/chr1"; description = "…"; }; }
+  #
+  # Keyed by the *placeholder* name, so the tool can join a placeholder it found
+  # in the script to the path it should read it from. `file` defaults to the key,
+  # and the tool applies that default -- the manifest does not repeat it, so a
+  # consumer can tell "explicitly a file name" from "no file given".
+  varFiles = config:
+    lib.mapAttrs
+      (name: v: { inherit (v) file description; })
+      config.mikrotik.varFiles;
+
+  # Everything the deploy tool needs to resolve placeholders: what it can mint
+  # (`generators`), and what it has to read from `--secrets-dir` (`varFiles`).
+  #
+  # One document rather than two files, because the tool is given one path
+  # (`--generators`) and a value is either minted or read -- never both.
+  manifest = config: {
+    generators = generators config;
+    varFiles = varFiles config;
+  };
+
   # The fleet form, unevaluated: every router declared under `mikrotik.routers`,
   # as the config `evalMikrotik` would return for it.
   #

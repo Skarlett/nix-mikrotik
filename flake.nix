@@ -176,7 +176,7 @@
             # names the fix: every assertion, plus the control that must pass.
             eval = import ./tests/eval.nix {
               inherit pkgs;
-              inherit (mt) evalMikrotik evalMikrotikRaw generators;
+              inherit (mt) evalMikrotik evalMikrotikRaw generators manifest;
             };
 
             # Boot the pinned CHR image and wait for a RouterOS login prompt.
