@@ -160,15 +160,18 @@ rec {
   # The values a configuration expects from elsewhere, as data the deploy tool
   # reads alongside the generators:
   #
-  #   { "mesh-chr1-private-key" = { file = "mikrotik-lab-peers/chr1"; description = "…"; }; }
+  #   { "mesh-chr1-private-key" = { path = "per-machine/flagship/mikrotik-lab-peers/chr1"; description = "…"; }; }
   #
   # Keyed by the *placeholder* name, so the tool can join a placeholder it found
-  # in the script to the path it should read it from. `file` defaults to the key,
-  # and the tool applies that default -- the manifest does not repeat it, so a
-  # consumer can tell "explicitly a file name" from "no file given".
+  # in the script to the path it should read it from. `path` is clan's own
+  # spelling of where a generated file sits -- `per-machine/<machine>/<generator>`
+  # or `shared/<generator>`, plus the file name -- relative to the vars directory
+  # the deploy is pointed at with `--secrets-dir`; the class derives it from the
+  # machine and the generator's `share` flag, so it cannot drift from what
+  # `clan vars generate` wrote.
   varFiles = config:
     lib.mapAttrs
-      (name: v: { inherit (v) file description; })
+      (name: v: { inherit (v) path description; })
       config.mikrotik.varFiles;
 
   # Everything the deploy tool needs to resolve placeholders: what it can mint

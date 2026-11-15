@@ -95,47 +95,122 @@ let
       description = "Raw RouterOS lines appended verbatim. The escape hatch.";
     };
 
-    # A secret this router does not mint: it was generated somewhere else (a
-    # clan machine's generator, typically the controller that owns the tunnel)
-    # and the deploy tool only has to read it out of `--secrets-dir`. Naming it
-    # here is what separates "the value exists elsewhere" from "the value does
-    # not exist at all" -- and the failure mode being guarded against is a typo
-    # in a `mkSecret` call, which is silent unless the name is known in advance.
+    # A value this router does not mint: it was generated somewhere else (a clan
+    # machine's generator, typically the controller that owns the tunnel) and the
+    # deploy tool only has to read it out of `--secrets-dir`. Naming it here is
+    # what separates "the value exists elsewhere" from "the value does not exist
+    # at all" -- and the failure mode being guarded against is a typo in a
+    # `mkSecret` call, which is silent unless the name is known in advance.
+    #
+    # The entry describes a *generated file the way clan describes one*, not a
+    # second scheme: clan files a generator's files under
+    #
+    #     per-machine/<machine>/<generator>/<file>    (generator.share = false)
+    #     shared/<generator>/<file>                   (generator.share = true)
+    #
+    # and `path` below is exactly that, relative to the vars directory the deploy
+    # is pointed at with `--secrets-dir`. `relDir` is derived the way clan derives
+    # it -- from the machine and the generator's `share` flag -- so a value clan
+    # generated is found without restating where clan put it, and a value that
+    # moves (a target renamed to a machine, `share` flipped on) moves here too.
     varFiles = mkOption {
-      type = types.attrsOf (types.submodule {
-        options = {
-          description = mkOption {
-            type = types.nullOr types.str;
-            default = null;
-            description = "What the value is, for generated documentation.";
+      type = types.attrsOf (types.submodule ({ name, config, ... }:
+        let
+          # The placeholder name is already clan's identity for a file *inside* a
+          # generator (`<generator>/<file>`), so the common entry states nothing
+          # at all: no generator, no file, no path.
+          parts = lib.splitString "/" name;
+          named = lib.length parts == 2;
+        in
+        {
+          options = {
+            description = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              description = "What the value is, for generated documentation.";
+            };
+            generator = mkOption {
+              type = types.nullOr types.str;
+              default = if named then lib.head parts else null;
+              defaultText = literalExpression "the `<generator>` half of the attribute name";
+              description = ''
+                The generator that mints it (`clan.core.vars.generators.<name>`),
+                which is also the directory clan files it in. Taken from the
+                attribute name when that is `<generator>/<file>`.
+              '';
+            };
+            file = mkOption {
+              type = types.str;
+              default = if named then lib.elemAt parts 1 else name;
+              defaultText = literalExpression "the `<file>` half of the attribute name";
+              description = "The file's name inside that generator (`files.<name>`).";
+            };
+            machine = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              defaultText = literalExpression "config.mikrotik.routerName";
+              description = ''
+                The vars root that holds it: clan files a non-shared generator
+                under `per-machine/<machine>/<generator>`. Defaults to this
+                router's own name, which is where its own generators land; set it
+                for a value minted on the machine that deploys (the usual case,
+                since that is the machine that holds the tunnel's other end).
+              '';
+            };
+            share = mkOption {
+              type = types.bool;
+              default = false;
+              description = ''
+                Mirror of the generator's `share` flag: a shared var is filed
+                once under `shared/<generator>` instead of per machine.
+              '';
+            };
+            relDir = mkOption {
+              type = types.str;
+              readOnly = true;
+              description = ''
+                The generator's directory, spelled the way clan spells its
+                `rel_dir` -- the one thing a deploy has to agree on.
+              '';
+              default =
+                if config.share then
+                  "shared/${toString config.generator}"
+                else
+                  "per-machine/${if config.machine != null then config.machine else cfg.routerName}/${toString config.generator}";
+            };
+            path = mkOption {
+              type = types.str;
+              readOnly = true;
+              description = ''
+                `relDir` and the file name: the path of the value under
+                `--secrets-dir`, which is the vars directory (`vars/`) the deploy
+                is pointed at. This is what the manifest carries, and what the
+                deploy tool joins to `--secrets-dir`.
+              '';
+              default = "${config.relDir}/${config.file}";
+            };
           };
-          file = mkOption {
-            type = types.nullOr types.str;
-            default = null;
-            description = ''
-              Where the value sits under `--secrets-dir`, as
-              `<generator>/<file>` or just `<file>`. Defaults to the attribute
-              name.
-
-              The placeholder is the attribute name, so this is the one place a
-              cell's name and the file it comes from can differ -- which is what
-              a value minted by a clan machine generator needs, since clan files
-              it under `per-machine/<machine>/<generator>/<file>`.
-            '';
-          };
-        };
-      });
+        }));
       default = { };
       example = literalExpression ''
-        { "mesh-chr1-private-key".file = "mikrotik-lab-peers/chr1"; }
+        {
+          # Minted on the machine that deploys, by a generator of its own.
+          "wg-mesh-chr1-private-key" = { machine = "flagship"; };
+
+          # A shared var: `shared/<generator>/<file>`, no machine.
+          "lab-peers/chr1" = { share = true; };
+        }
       '';
       description = ''
-        Secret values that are not produced by this router's own generators,
-        keyed by the name a menu cell references with `mkSecret`.
+        Values that are not produced by this router's own generators, keyed by
+        the name a menu cell references with `mkSecret`.
 
-        The attribute name is the placeholder name a cell uses. By default it is
-        also the file name under the deploy tool's `--secrets-dir`; set `file`
-        when the value lives under a generator's directory instead.
+        An entry is clan's description of a generated file: a generator, a file
+        inside it, and the machine whose vars root holds it. `path` is derived
+        from those (`per-machine/<machine>/<generator>/<file>`, or
+        `shared/<generator>/<file>`), so it agrees with `clan vars generate` by
+        construction rather than by a second convention that has to be kept in
+        step by hand.
 
         Prefer a `clan.core.vars.generators` declaration whenever the value can
         be minted at deploy time; this option is for a key another host already
@@ -191,6 +266,20 @@ let
   # would be a directory the tool never creates.
   secretPartRe = "[A-Za-z0-9][A-Za-z0-9._-]*";
   secretNameRe = "^${secretPartRe}(/${secretPartRe})?$";
+
+  # A `varFiles` entry has to resolve to a real file under the vars directory:
+  # a generator (which is a directory), the file inside it, and -- unless the
+  # generator is shared -- the machine. `..` and an absolute path are both ways
+  # to read outside `--secrets-dir`, and an empty segment is a path that exists
+  # nowhere; all three are refused here rather than at a deploy.
+  varPathRe = "^(${secretPartRe}/)+${secretPartRe}$";
+  badVarFiles = lib.filter
+    (name:
+      let entry = cfg.varFiles.${name}; in
+      entry.generator == null
+      || builtins.match varPathRe entry.path == null
+      || lib.any (segment: segment == "." || segment == "..") (lib.splitString "/" entry.path))
+    (lib.attrNames cfg.varFiles);
 
   # Every `<generator>/<file>` this router's
   # `clan.core.vars.generators` declarations produce: the identities a menu
@@ -841,6 +930,21 @@ in
           message = ''
             a prompt name is not usable as a file name: letters, digits, dot,
             dash and underscore only, starting with a letter or a digit
+          '';
+        }
+        {
+          # `varFiles` is clan's description of a generated file, so it has to
+          # resolve to one: a generator, a file inside it, and a machine unless
+          # the generator is shared. A path with `..`, an absolute path or an
+          # empty segment is either a value nothing will find or a read outside
+          # the vars directory the deploy was pointed at.
+          assertion = badVarFiles == [ ];
+          message = ''
+            these mikrotik.varFiles entries do not resolve to `<rel_dir>/<file>`
+            under the vars directory -- name them `<generator>/<file>` (the
+            placeholder), or set `generator` and `file` explicitly, and leave
+            `machine`/`share` to place the generator:
+            ${toString badVarFiles}
           '';
         }
       ]
