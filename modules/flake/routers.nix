@@ -75,7 +75,6 @@ let
     (_: router: {
       script = mt.renderConfig router;
       generators = mt.generators router;
-      varFiles = mt.varFiles router;
       manifest = mt.manifest router;
     })
     (evaluated // fromServices);

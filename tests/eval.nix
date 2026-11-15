@@ -182,76 +182,43 @@ let
   controlConfig = evalMikrotik { inherit pkgs; modules = [ control ]; };
   controlHostname = controlConfig.mikrotik.hostname;
 
-  # A value this router does not mint at all: a key its controller generated.
-  # `varFiles` names it so the "is this placeholder declared?" assertion can
-  # tell a real hand-off from a typo, and the value is read from `--secrets-dir`
-  # at deploy time rather than from a generator manifest entry.
-  #
-  # The entry is clan's description of a generated file: a generator, the file
-  # inside it, and the machine whose vars root holds it. `path` is derived --
-  # `per-machine/<machine>/<generator>/<file>` -- so it is the same path
-  # `clan vars generate` writes for that generator, and the deploy only has to be
-  # pointed at the vars directory.
-  varFileModule = { mkSecret, ... }: {
-    mikrotik = {
-      hostname = "router2";
-      varFiles."mikrotik-lab-peers/mesh-chr1-private-key" = {
-        machine = "flagship";
-        description = "chr1's key, minted on its controller";
-      };
-      sections."/interface wireguard" = [
-        { name = "wg0"; private-key = mkSecret "mikrotik-lab-peers/mesh-chr1-private-key"; }
-      ];
-    };
-  };
-  varFileConfig = evalMikrotik { inherit pkgs; modules = [ varFileModule ]; };
-  varFileDeclared = builtins.attrNames varFileConfig.mikrotik.varFiles;
-  varFileGenerated = generators varFileConfig;
-  # The manifest is the document the tool reads: the generators to run, and the
-  # hand-offs to read from `--secrets-dir`, each with the path clan would file it
-  # at. Nothing restates where the value lives -- it is derived from the machine
-  # and the generator, the two things clan derives it from.
-  varFileManifest = manifest varFileConfig;
-  varFilePath = varFileManifest.varFiles."mikrotik-lab-peers/mesh-chr1-private-key".path;
-  # ... and a shared generator has no machine at all: clan files it once under
-  # `shared/<generator>`, so the path does not carry one.
-  varFileSharedModule = { mkSecret, ... }: {
-    mikrotik = {
-      hostname = "router2";
-      varFiles."lab-peers/chr1".share = true;
-      sections."/interface wireguard" = [
-        { name = "wg0"; private-key = mkSecret "lab-peers/chr1"; }
-      ];
-    };
-  };
-  varFileSharedPath =
-    (manifest (evalMikrotik { inherit pkgs; modules = [ varFileSharedModule ]; }))
-    .varFiles."lab-peers/chr1".path;
-  # An entry that names no generator is not a hand-off at all: clan has nowhere
-  # to file it, so it would be a path nothing writes.
-  varFileUngeneratedRefused = refused [
+  # A hand-off is a generator too: there is no separate option for "a value
+  # minted somewhere else". A value that already exists is a generator with a
+  # persisted prompt and no script, and a value another machine minted is a
+  # generator that machine declares -- so this asserts the two things option
+  # parity buys: the manifest carries no second section, and a placeholder that
+  # is not a file of some declared generator is refused.
+  declaredConfig = evalMikrotik { inherit pkgs; modules = [ control ]; };
+  declaredManifest = manifest declaredConfig;
+  declaredHasNoHandOffSection = !(declaredManifest ? varFiles);
+
+  # ... and the refusal names the declaration that is missing.
+  undeclaredRefused = refused [
     ({ mkSecret, ... }: {
       mikrotik = {
         hostname = "router2";
-        varFiles."mesh-chr1-private-key".description = "no generator named";
         sections."/interface wireguard" = [
-          { name = "wg0"; private-key = mkSecret "mesh-chr1-private-key"; }
+          { name = "wg0"; private-key = mkSecret "nowhere/rpivate-key"; }
         ];
       };
     })
   ];
-  # ... and it is still a placeholder a typo cannot slip past.
-  varFileTypoRefused = refused [
+  # The control: the same shape, with the generator declared, is accepted -- so
+  # the refusal above is the missing declaration and not the option shape.
+  declaredAccepted = !(refused [
     ({ mkSecret, ... }: {
+      clan.core.vars.generators.declared-key = {
+        files.privkey.secret = true;
+        script = "wg genkey > $out/privkey";
+      };
       mikrotik = {
         hostname = "router2";
-        varFiles."mikrotik-lab-peers/mesh-chr1-private-key".machine = "flagship";
         sections."/interface wireguard" = [
-          { name = "wg0"; private-key = mkSecret "mikrotik-lab-peers/mesh-chr1-rpivate-key"; }
+          { name = "wg0"; private-key = mkSecret "declared-key/privkey"; }
         ];
       };
     })
-  ];
+  ]);
 
   # The generator list is in dependency order and carries each file's place in
   # the var store, which is what the deploy tool runs on. `wg-key` is declared
@@ -319,37 +286,20 @@ pkgs.runCommand "check-eval" { } ''
   }
   printf 'pkgs | argument | %s, specialArgs extends but cannot override\n' ${lib.escapeShellArg pkgsSystem} >> $out/refusals.txt
 
-  # -- a value generated elsewhere is declared, not minted here --------------
-  [ ${lib.escapeShellArg (lib.concatStringsSep "," varFileDeclared)} = 'mikrotik-lab-peers/mesh-chr1-private-key' ] || {
-    echo "varFiles did not declare the hand-off: ${lib.concatStringsSep "," varFileDeclared}" >&2
+  # -- a hand-off is a generator, so there is no second section --------------
+  [ ${if declaredHasNoHandOffSection then "0" else "1"} -eq 0 ] || {
+    echo "the manifest grew a hand-off section; a value that exists elsewhere is a generator" >&2
     exit 1
   }
-  [ -z ${lib.escapeShellArg (lib.concatStringsSep "," (map (g: g.name) varFileGenerated))} ] || {
-    echo "a varFiles entry reached the generator manifest" >&2
+  [ ${if undeclaredRefused then "0" else "1"} -eq 0 ] || {
+    echo "a placeholder that is no generator's file was accepted" >&2
     exit 1
   }
-  [ ${if varFileTypoRefused then "0" else "1"} -eq 0 ] || {
-    echo "a typo against varFiles was not refused" >&2
+  [ ${if declaredAccepted then "0" else "1"} -eq 0 ] || {
+    echo "a declared generator file was refused, so the refusal above proves nothing" >&2
     exit 1
   }
-  [ ${if varFileUngeneratedRefused then "0" else "1"} -eq 0 ] || {
-    echo "a varFiles entry with no generator was accepted, so its path names nothing" >&2
-    exit 1
-  }
-  # The path is clan's own layout, derived: the machine, the generator, the file.
-  [ ${lib.escapeShellArg varFilePath} = 'per-machine/flagship/mikrotik-lab-peers/mesh-chr1-private-key' ] || {
-    echo "a varFiles entry did not reach the manifest as clan's path: ${varFilePath}" >&2
-    exit 1
-  }
-  # ... and a shared generator has no machine in its path at all.
-  [ ${lib.escapeShellArg varFileSharedPath} = 'shared/lab-peers/chr1' ] || {
-    echo "a shared varFiles entry did not render under shared/: ${varFileSharedPath}" >&2
-    exit 1
-  }
-  printf 'varFiles | declared | %s, path %s, shared %s, typo and no-generator refused\n' \
-    ${lib.escapeShellArg (lib.concatStringsSep "," varFileDeclared)} \
-    ${lib.escapeShellArg varFilePath} \
-    ${lib.escapeShellArg varFileSharedPath} >> $out/refusals.txt
+  printf 'generators | no hand-off section | undeclared refused | declared accepted\n' >> $out/refusals.txt
 
   # -- every assertion fires, with a diagnostic that names the fix ----------
   ${lib.concatMapStrings (r: ''
