@@ -18,6 +18,7 @@ let
   raw = import mikrotik-config;
   hostname = raw."/system identity".name or "MikroTik";
   config = mt.evalMikrotik {
+    inherit pkgs;
     modules = [
       {
         mikrotik.hostname = hostname;

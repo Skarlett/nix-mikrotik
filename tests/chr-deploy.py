@@ -38,7 +38,7 @@ written and where every assertion below was first measured:
 
   tests/chr-deploy.py --host 127.0.0.1 --ssh-port 2201 --rest-port 8081 \\
       --script <chr-fixture>/router-config.rsc --expect-hostname chr-deploy \\
-      --secret wg-private-key=<base64> --secret dns-comment=<value> \\
+      --secret wg/private-key=<base64> --secret dns/comment=<value> \\
       --broken-script tests/fixtures/refused.rsc --cli <nix-mikrotik>
 """
 
@@ -294,7 +294,9 @@ def deploy(cli: str, script: str, host: str, ssh_port: int, key: str,
             "--key", key, "--verify"]
     for item in secrets:
         name, value = item.split("=", 1)
-        path = os.path.join(workdir, f"secret-{name}")
+        # A secret name is `<generator>/<file>`, which is a path, not a file
+        # name: flatten it before staging it.
+        path = os.path.join(workdir, "secret-" + name.replace("/", "-"))
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(value)
@@ -420,8 +422,8 @@ def main() -> int:
         # A secret substituted into a comment and read back byte for byte: the
         # value the deploy tool had to quote and escape on its way in.
         run.check("a secret delivered into a comment reads back byte for byte",
-                  "dns-comment" in secrets
-                  and entry.get("comment") == secrets["dns-comment"],
+                  "dns/comment" in secrets
+                  and entry.get("comment") == secrets["dns/comment"],
                   repr(entry.get("comment", "none")))
 
         nat = rest.menu("/ip/firewall/nat")

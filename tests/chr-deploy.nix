@@ -39,8 +39,8 @@ let
     "--rest-port 8081"
     "--script ${script}/router-config.rsc"
     "--expect-hostname chr-deploy"
-    "--secret ${lib.escapeShellArg "wg-private-key=${wgKey}"}"
-    "--secret ${lib.escapeShellArg "dns-comment=${dnsComment}"}"
+    "--secret ${lib.escapeShellArg "wg/private-key=${wgKey}"}"
+    "--secret ${lib.escapeShellArg "dns/comment=${dnsComment}"}"
     "--broken-script ${refusedScript}"
     "--cli ${nix-mikrotik}/bin/nix-mikrotik"
   ]);

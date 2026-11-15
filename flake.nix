@@ -28,16 +28,20 @@
         legacy = [ ./examples/legacy-wrapper.nix ];
       };
 
-      # Pure evaluation, system-independent: consumers and `nix eval` read this.
-      evaluated = lib.mapAttrs
-        (_: modules: mt.evalMikrotik { inherit modules; })
+      # Pure evaluation, system-independent in what it *means* -- but a
+      # generator's `runtimeInputs` are store paths, so the config is evaluated
+      # per system rather than once here. `nix eval` still reads
+      # `flake.lib.evalMikrotik` for the pure form.
+      evaluatedFor = pkgs: lib.mapAttrs
+        (_: modules: mt.evalMikrotik { inherit modules pkgs; })
         exampleModules;
 
       # The configuration `checks.chr-deploy` applies to a real RouterOS.
       # Written for a CHR -- one ethernet port, no wireless -- rather than
       # reusing an example, which describes upstream's router (ether2 … sfp1).
-      chrFixture = mt.evalMikrotik {
+      chrFixtureFor = pkgs: mt.evalMikrotik {
         modules = [ ./tests/fixtures/chr-configuration.nix ];
+        inherit pkgs;
       };
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
@@ -50,6 +54,15 @@
       # `mikrotikConfigurations.<name>`, which is what a consumer gets without
       # writing any wiring of its own.
       mikrotik.routers.directory = ./examples/routers;
+
+      # A router is evaluated against a package set, and there is exactly one
+      # per flake output. The script is text and identical everywhere; what is
+      # not identical is a generator's `runtimeInputs`, which are store paths
+      # for the machine that will run the generator -- the deployer. This
+      # repository deploys to CHRs and x86_64 hosts, so that is the set; a
+      # consumer whose routers are built for several systems evaluates them
+      # under `perSystem`, where `pkgs` is the system in question.
+      mikrotik.routers.pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux;
 
       flake = {
         # The module class itself.
@@ -77,6 +90,8 @@
       perSystem = { pkgs, config, ... }:
         let
           chr = pkgs.callPackage ./chr { };
+          evaluated = evaluatedFor pkgs;
+          chrFixture = chrFixtureFor pkgs;
         in
         {
           # One script derivation per example, per system: `nix build
@@ -134,6 +149,20 @@
               inherit (evaluated) example typed;
             };
 
+            # The `networks.<name>` schema fixture: the whole render, and the
+            # generator manifest the deploy tool reads off the same config.
+            networks = import ./tests/networks.nix {
+              inherit pkgs;
+              inherit (mt) render generators;
+              config = mt.evalMikrotik {
+                modules = [
+                  ./examples/networks.nix
+                  { networks."9600-baud".enable = true; }
+                ];
+                inherit pkgs;
+              };
+            };
+
             # The CLI's secret handling: placeholders listed, substituted with
             # the quoting RouterOS needs, and refused when a value or a name is
             # unusable -- plus the claim its failure message is allowed to make.
@@ -147,7 +176,7 @@
             # names the fix: every assertion, plus the control that must pass.
             eval = import ./tests/eval.nix {
               inherit pkgs;
-              inherit (mt) evalMikrotik evalMikrotikRaw mkSecret;
+              inherit (mt) evalMikrotik evalMikrotikRaw generators;
             };
 
             # Boot the pinned CHR image and wait for a RouterOS login prompt.
@@ -176,7 +205,7 @@
             # the router that is wrong.
             fleet = import ./tests/fleet.nix {
               inherit pkgs;
-              inherit (mt) evalMikrotik evalMikrotikFleet evalMikrotikRaw mkSecret;
+              inherit (mt) evalMikrotik evalMikrotikFleet evalMikrotikFleetConfigs evalMikrotikRaw mkSecret generators;
             };
           };
 

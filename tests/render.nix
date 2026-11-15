@@ -43,9 +43,10 @@ pkgs.runCommand "check-render" { } ''
 
   cp ${pkgs.writeText "module.rsc" (render example)} $out/module.rsc
 
-  # A secret is a placeholder in the store, never a value.
-  grep -q 'private-key=__MIKROTIK_SECRET_wg-private-key__' $out/module.rsc
-  grep -q 'passphrase=__MIKROTIK_SECRET_wifi-password__' $out/module.rsc
+  # A secret is a placeholder in the store, never a value. The name is
+  # `<generator>/<file>`, which is what the deploy tool substitutes.
+  grep -q 'private-key=__MIKROTIK_SECRET_wg-private-key/privkey__' $out/module.rsc
+  grep -q 'passphrase=__MIKROTIK_SECRET_wifi-password/passphrase__' $out/module.rsc
 
   # sectionOrder puts the bridge before anything that references it.
   bridge_line=$(grep -n '^/interface bridge' $out/module.rsc | cut -d: -f1)

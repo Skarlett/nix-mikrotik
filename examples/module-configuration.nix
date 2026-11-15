@@ -8,11 +8,45 @@
 # references rather than strings.
 #
 # Two things here have no upstream equivalent: the Wi-Fi security profile and
-# the WireGuard interface carry secrets, which render as placeholders and are
-# filled in by `nix-mikrotik deploy` on the machine that holds them.
-{ mkSecret, ... }:
+# the WireGuard interface carry secrets. Each is declared as a generator -- in
+# clan's own shape, `clan.core.vars.generators.<name>` -- and the menu cell
+# holds `files.<file>.placeholder`, which renders as a marker and is replaced by
+# `nix-mikrotik deploy` on the machine that runs the generator. Neither value is
+# ever in the store, and neither is in this file.
+{ config, pkgs, ... }:
 {
   imports = [ ../modules/hardening.nix ];
+
+  # The generators that mint this router's secrets, in the shape clan uses:
+  # `files` says what the script writes, `prompts` asks a human for a value that
+  # cannot be minted, and `script` runs on the deploying machine with `$out`,
+  # `$in` and `$prompts` set.
+  #
+  # `nix-mikrotik generate` runs them and keeps the values under
+  # `vars/per-machine/nidas/<generator>/<file>`; nothing here or in the store
+  # holds a value.
+  clan.core.vars.generators = {
+    wg-private-key = {
+      files.privkey.secret = true;
+      # `wg` comes from here, not from whatever the deploying machine happens to
+      # have on PATH.
+      runtimeInputs = [ pkgs.wireguard-tools ];
+      script = "wg genkey > $out/privkey";
+    };
+
+    wifi-password = {
+      files.passphrase = { };
+      # A passphrase is chosen, not derived: a persisted prompt *is* a file of
+      # the generator, so the deploy tool copies it from `$prompts` to `$out`
+      # and no script is needed.
+      prompts.passphrase = {
+        description = "WPA2 passphrase for the `wifi` bridge";
+        type = "hidden";
+        persist = true;
+      };
+      script = "";
+    };
+  };
 
   mikrotik = {
     hostname = "nidas";
@@ -33,17 +67,6 @@
       "/ip firewall filter"
       "/ip firewall nat"
     ];
-
-    secrets = {
-      wifi-password = {
-        description = "WPA2 passphrase for the `wifi` bridge";
-        file = "wifi-password";
-      };
-      wg-private-key = {
-        description = "WireGuard private key for wg.luninet";
-        file = "wg-private-key";
-      };
-    };
 
     sections = {
       "/interface bridge" = [
@@ -119,7 +142,7 @@
           name = "wg.luninet";
           listen-port = 57676;
           mtu = 1420;
-          private-key = mkSecret "wg-private-key";
+          private-key = config.clan.core.vars.generators.wg-private-key.files.privkey.placeholder;
         }
       ];
 
@@ -138,7 +161,7 @@
         {
           name = "default";
           authentication-types = "wpa2-psk";
-          passphrase = mkSecret "wifi-password";
+          passphrase = config.clan.core.vars.generators.wifi-password.files.passphrase.placeholder;
         }
       ];
 

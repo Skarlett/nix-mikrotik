@@ -42,14 +42,21 @@ nix run .#nix-mikrotik -- render --name example -o router.rsc
 A configuration is a module:
 
 ```nix
-{ mkSecret, ... }:
+{ config, pkgs, ... }:
 {
   imports = [ (import "${nix-mikrotik}/modules/hardening.nix") ];
 
+  # The key the tunnel needs, as the generator that mints it. This is clan's own
+  # generator interface, unchanged: a generator is a shell script plus the files
+  # it declares, and each file says whether it is a secret.
+  clan.core.vars.generators.wg-private-key = {
+    files.privkey.secret = true;
+    runtimeInputs = [ pkgs.wireguard-tools ];
+    script = "wg genkey > $out/privkey";
+  };
+
   mikrotik = {
     hostname = "router1";
-
-    secrets.wg-private-key.file = "wg-private-key";
 
     sections = {
       "/interface bridge" = [ { name = "bridge"; } ];
@@ -57,7 +64,10 @@ A configuration is a module:
         { address = "10.10.10.1/24"; interface = "bridge"; }
       ];
       "/interface wireguard" = [
-        { name = "wg0"; private-key = mkSecret "wg-private-key"; }
+        {
+          name = "wg0";
+          private-key = config.clan.core.vars.generators.wg-private-key.files.privkey.placeholder;
+        }
       ];
     };
   };
@@ -77,13 +87,13 @@ and a section defined in two modules merges rather than colliding.
 | `mikrotik.sections` | RouterOS menus keyed by command path — upstream's data model, unchanged |
 | `mikrotik.<menu>` | the same menus as options, one per menu, e.g. `mikrotik.ip."dhcp-server".network` (see below) |
 | `mikrotik.sectionOrder` | sections to render first, for objects that must exist before they are referenced |
-| `mikrotik.secrets` | secrets the configuration references, by name |
+| `clan.core.vars.generators` | the values the configuration needs, as generators — clan's own interface, so a declaration moves between a clan machine and a router unchanged |
 | `mikrotik.extraScript` | raw lines appended verbatim, for anything the data model cannot express |
 | `mikrotik.checkMenuAttributes` | reject an attribute name a menu does not list (on) |
 
 Assertions fail the *evaluation*, not a device: an empty hostname, a section
-path that is not a RouterOS command path, a `mkSecret` with no matching
-declaration, or a `/system identity` section that would fight the option.
+path that is not a RouterOS command path, a secret placeholder with no matching
+generator file, or a `/system identity` section that would fight the option.
 
 Booleans render as `yes`/`no` and integers bare, so a configuration reads like
 Nix rather than like a stringly-typed script.
@@ -133,7 +143,9 @@ attrset of children. A menu that has submenus carries its own body under
 `items`; every other menu is written directly:
 
 ```nix
-mikrotik.interface.wireguard.items = [ { name = "wg0"; listen-port = 51820; private-key = mkSecret "wg0"; } ];
+mikrotik.interface.wireguard.items = [
+  { name = "wg0"; listen-port = 51820; private-key = config.clan.core.vars.generators.wg0.files.private-key.placeholder; }
+];
 mikrotik.interface.wireguard.peers = [ { interface = "wg0"; name = "peer1"; public-key = "…"; } ];
 
 mikrotik.ip.address = [ { address = "10.0.0.3/24"; interface = "vlan10"; network = "10.0.0.0"; } ];
@@ -176,24 +188,34 @@ own `/export` use, and adding a menu or an attribute is one line in that file.
 ## Secrets
 
 RouterOS cannot run sops-nix, so a secret cannot be *activated* onto a router
-the way it is onto a NixOS host. It is **delivered** instead:
+the way it is onto a NixOS host. It is **generated** on the deploying machine and
+**delivered**:
 
-1. the configuration refers to a secret with `mkSecret "name"`;
-2. the build renders `__MIKROTIK_SECRET_name__` — the value is never in the
+1. the configuration declares a generator under `clan.core.vars.generators.<name>`
+   — clan's own interface, not a spelling of it. A generator is a shell script
+   plus the files it declares, and each file says whether it is a secret;
+2. a menu cell takes `config.clan.core.vars.generators.<g>.files.<f>.placeholder`,
+   which renders as `__MIKROTIK_SECRET_<g>/<f>__` — the value is never in the
    store, and the script is safe to build on any machine;
-3. `nix-mikrotik deploy` substitutes the real value from a file **on the
-   deploying machine** (a clan var, a sops file, anything that is a path),
-   into a `0600` file under a `0700` temporary directory;
-4. it uploads, imports, and **removes the uploaded copy from the router**,
-   because that file holds the plaintext secret;
+3. `nix-mikrotik generate <manifest>` runs the generators that script needs, once
+   each, in dependency order, and keeps the values in a state directory laid out
+   the way clan lays out its var store (`per-machine/<router>/<generator>/<file>`,
+   or `shared/<generator>/<file>` for a `share = true` generator), because the
+   manifest carries that `relDir` per file and the tool writes nowhere else. A
+   file is written `0400`; a file declared `secret = false` is written `0444` and
+   printed, because it is not a secret (a public key) and another machine has to
+   read it;
+4. `nix-mikrotik deploy` substitutes the real value into the script, quoting and
+   escaping it the way RouterOS needs it, into a `0600` file under a `0700`
+   temporary directory, uploads, imports, and **removes the uploaded copy from
+   the router**, because that file holds the plaintext;
 5. it refuses to deploy at all if any placeholder is unresolved — and it refuses
-   a placeholder *name* that is not usable as a file name
-   (`[A-Za-z0-9][A-Za-z0-9._-]*`), because that name is also the file the value
-   is read from;
-6. the value is **quoted and escaped** the way RouterOS needs it (`"`, `\`, `$`)
-   before it goes into the line: an unquoted base64 key — every WireGuard
-   private key — makes the device end the command early, abort the whole script
-   and still exit 0;
+   a placeholder *name* whose parts are not usable as file names
+   (`[A-Za-z0-9][A-Za-z0-9._-]*`, one `/` between generator and file), because
+   that name is also the path the value is read from;
+6. an unquoted base64 key — every WireGuard private key — makes the device end
+   the command early, abort the whole script and still exit 0, which is why
+   (4) quotes and escapes `"`, `\` and `$` rather than trusting the value;
 7. a script the device did not finish running is a **failure, not a silent
    no-op**: `deploy` appends a one-line sentinel to the uploaded copy and reads
    the device's log back, so it cannot print `verified` for an import that
@@ -202,39 +224,59 @@ the way it is onto a NixOS host. It is **delivered** instead:
    exactly that rather than claiming the device is unchanged, and warns that a
    re-run can duplicate what the first attempt managed to apply.
 
+```nix
+clan.core.vars.generators.wg-chr1 = {
+  files.private-key.secret = true;
+  files.public-key.secret = false;        # published: the peers need it
+  runtimeInputs = [ pkgs.wireguard-tools ];
+  script = ''
+    wg genkey | tee $out/private-key | wg pubkey > $out/public-key
+  '';
+};
+```
+
+The interface is clan's, with three deviations, each because the target is
+RouterOS rather than a NixOS machine (`modules/base.nix` says so where the
+options are declared):
+
+* **no var store is read while evaluating.** `path`, `value` and `exists` throw
+  with an explanation instead of resolving to a file: a router script is rendered
+  on a machine that does not hold the values. Use `placeholder`.
+* **`owner`, `group`, `neededFor` and `restartUnits` are accepted and ignored.**
+  RouterOS has no users, no systemd and no activation step to restart.
+* **`finalScript` is text, not a store path**, so a class can be evaluated
+  without building anything.
+
+Everything else is the real thing: `files`, `prompts` (a persisted prompt *is* a
+file of the generator, so such a generator writes no script), `dependencies`
+(`$in/<generator>/<file>`), `share`, `validation`, `runtimeInputs`. The
+configuration asserts what it can: a generator with no files, a dependency on a
+generator this router does not declare, a dependency cycle, and a placeholder no
+declaration produces all fail the evaluation with a message that names the fix.
+
 ```sh
+nix eval --impure --raw .#mikrotikConfigurations.r1.generators \
+  | jq . > manifest.json            # or: nix build .#...-generators
+
+nix-mikrotik generate manifest.json --state-dir ./vars
 nix-mikrotik deploy router.rsc --host 10.0.0.1 \
-  --secret wg-private-key=/run/secrets/vars/shared/mikrotik/wg-private-key \
+  --generators manifest.json --generator-state-dir ./vars \
   --verify --expect-hostname router1
 ```
 
-The value exists in three places, briefly: the deploying machine's secret
-store, a temporary file on it, and the router's flash between upload and
-removal. That last one is unavoidable — `/import` takes a file, not stdin — and
-is why the file is removed in a `finally` block rather than at the end of the
-happy path.
+`--state-dir` is outside the repository on purpose: the values are the one thing
+that must not be committed, and the layout is clan's so that the same directory
+can be the one clan deploys into.
 
-## Clan vars (how the fleet supplies these secrets)
+## Clan vars
 
-This repository does not declare the generators — a clan vars generator belongs
-to the machine that holds the value, so the fleet's lives in `Infra/lunix`,
-`modules/vars/generators/mikrotik.nix` ([lunix #131](https://codex.unallocatedspace.luni/Infra/lunix/pulls/131)).
-What makes the two halves fit is one convention:
-
-> **the generator's file names are the `mkSecret` names.**
-
-A name is therefore constrained to `[A-Za-z0-9][A-Za-z0-9._-]*`: a dot-file
-name, a name with a `/` or a `..` is not a file name in a directory and not a
-`mkSecret` name either. The renderer asserts it (`modules/base.nix`), so it is a
-build failure rather than a placeholder the tool silently skips or a path it
-reads from outside `--secrets-dir`.
-
-So the directory clan deploys the vars into *is* a secrets directory, and the
-deploy is one command with no mapping layer:
+The point of keeping the `clan.core.*` options is that this half needs no
+adapter. A generator declared in a clan machine — in `Infra/lunix`,
+`modules/vars/generators/mikrotik.nix` — files its values under
+`vars/per-machine/<machine>/<generator>/<file>`, and a router declaring the same
+generator reads exactly those files:
 
 ```sh
-# flagship holds the generator; clan deploys its files to
-# /run/secrets/vars/per-machine/<machine>/<generator>/<file>
 nix-mikrotik deploy router.rsc \
   --host 10.1.0.3 --user admin \
   --key /run/secrets/vars/per-machine/flagship/mikrotik-homelab-router/ssh-key \
@@ -242,16 +284,15 @@ nix-mikrotik deploy router.rsc \
   --verify --expect-hostname homelab
 ```
 
-The generator there declares exactly `wg-chr1-luninet`, `wg-chr1-main`,
-`wg-chr1-mgmt` (prompted, persisted — the router is in service and minting new
-keys would break three tunnels), plus a generated `ssh-key`/`ssh-key.pub` pair
-for the deployer. Three of those match `private-key = mkSecret "wg-chr1-…"` in
-`modules/mikrotik/routers/homelab-router.nix`, which is the whole contract.
+A name is therefore `<generator>/<file>`, and both parts are constrained to
+`[A-Za-z0-9][A-Za-z0-9._-]*` — a dot-file name, a name with `..` is not a file
+name in a directory and not a placeholder name either. The assertion is in
+`modules/base.nix`, so it is a build failure rather than a placeholder the tool
+silently skips or a path it reads from outside the state directory.
 
 `--secrets-dir` reads only the files the script asks for, so the directory can
 carry more than the script needs (the public half, for one). `tests/cli.nix`
-exercises exactly this shape: a directory of files named after the
-placeholders.
+exercises exactly this shape: a directory of files named after the placeholders.
 
 Where it stops: RouterOS cannot run sops-nix, so a var is **delivered**, not
 activated. Nothing in the fleet's `sops.secrets` reaches the router; the value
@@ -390,7 +431,7 @@ device's `script error: …` line is.
 ## Layout
 
 ```
-lib/            evalMikrotik, mkSecret, mkRouterScript, the renderer, the menu
+lib/            evalMikrotik, generators, mkRouterScript, the renderer, the menu
                 table (menus.nix) and the value types (types.nix)
 modules/        base.nix (the class), menus.nix (the typed menu options),
                 hardening.nix (composable defaults)

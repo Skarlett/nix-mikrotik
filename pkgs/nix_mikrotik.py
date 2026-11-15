@@ -36,6 +36,7 @@ device reports neither of them through ssh's exit status:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -53,7 +54,12 @@ DEFAULT_SCRIPT_NAME = "router-config.rsc"
 # placeholder. modules/base.nix asserts the same rule when the configuration is
 # evaluated; this is the half that covers a script the tool was handed rather
 # than one it rendered.
-SECRET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+#
+# A *generated* file is named `<generator>/<file>`: one slash, no more, because
+# the name doubles as the path below the state directory the value is kept at
+# and the tool only ever creates one level there.
+SECRET_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+SECRET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?")
 
 # Deliberately wider than SECRET_NAME_RE, because a script has to be *found* to
 # be refused. A matching pattern narrower than what a configuration can write
@@ -87,7 +93,9 @@ def check_secret_name(name: str) -> str:
     if not SECRET_NAME_RE.fullmatch(name):
         raise ToolError(
             f"secret name '{name}' is not usable as a file name: names must "
-            "match [A-Za-z0-9][A-Za-z0-9._-]* (no '/', no space, no '..')")
+            "match [A-Za-z0-9][A-Za-z0-9._-]* -- letters, digits, dot, dash and "
+            "underscore -- with at most one '/' naming a generator's file "
+            f"('{SECRET_PART_RE.pattern}' on each side of it)")
     return name
 
 
@@ -231,6 +239,212 @@ def generate_secrets(template: str, names: list[str], state_dir: str | None) -> 
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(value + "\n")
     return values
+
+
+def load_generator_manifest(path: str) -> list[dict]:
+    """Read the manifest `lib.generators` renders, or a flake's `<name>-generators`.
+
+    The shape is the one `secrets.<name>` has in nix, minus everything the tool
+    has no use for:
+
+        [ { "name": "wg-9600-baud-net-key"
+          , "files": [ { "name": "privkey", "secret": true }
+                     , { "name": "pubkey",  "secret": false } ]
+          , "runtimeInputs": [ "/nix/store/…-wireguard-tools" ]
+          , "script": "wg genkey | tee $out/privkey | wg pubkey > $out/pubkey" } ]
+
+    A list, not an attrset: the order is the order the generators were declared
+    in, and one generator's script may read what an earlier one published.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        raise ToolError(f"cannot read the generator manifest {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"{path} is not a generator manifest: {exc}") from exc
+    if not isinstance(data, list):
+        raise ToolError(
+            f"{path} is not a generator manifest: expected a list of generators, "
+            f"got {type(data).__name__}")
+    for gen in data:
+        if not isinstance(gen, dict):
+            raise ToolError(f"{path}: every generator must be an object, got {type(gen).__name__}")
+        name = gen.get("name")
+        if not isinstance(name, str) or not name:
+            raise ToolError(f"{path}: a generator has no name")
+        check_secret_name(name)
+        if "/" in name:
+            raise ToolError(f"{path}: generator name '{name}' must not contain '/'")
+        if not isinstance(gen.get("script"), str) or not gen["script"].strip():
+            raise ToolError(f"generator '{name}' has no script")
+        files = gen.get("files")
+        if not isinstance(files, list) or not files:
+            raise ToolError(f"generator '{name}' declares no files")
+        for entry in files:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                raise ToolError(f"generator '{name}' has a file with no name")
+            check_secret_name(f"{name}/{entry['name']}")
+        inputs = gen.get("runtimeInputs") or []
+        if not isinstance(inputs, list) or not all(isinstance(i, str) for i in inputs):
+            raise ToolError(f"generator '{name}' has runtimeInputs that are not paths")
+    return data
+
+
+def generator_file(state_dir: str, gen: dict, entry: dict) -> str:
+    """Where a generated file lives: `state_dir` + the `relDir` the manifest gave.
+
+    The layout is clan's, not this tool's: `per-machine/<machine>/<generator>/`
+    for a router's own values and `shared/<generator>/` for one declared
+    `share = true`. A manifest carries each file's `relDir` so this function
+    does not have to know which case it is in, and so a state directory that
+    clan owns can be read as-is -- the same files `clan vars get` would print,
+    at the same paths, without a translation table.
+
+    `relDir` is required rather than defaulted. A default would be a second
+    spelling of the layout, and the two would drift: the deploy tool would read
+    a value from one path while clan wrote it to another, which looks exactly
+    like a value that was never generated.
+    """
+    rel = entry.get("relDir")
+    if not isinstance(rel, str) or not rel:
+        raise ToolError(
+            f"generator '{gen.get('name')}' file '{entry.get('name')}' has no relDir: "
+            "the manifest has to say where the value belongs in the state directory")
+    if os.path.isabs(rel) or ".." in rel.split("/"):
+        raise ToolError(
+            f"generator '{gen.get('name')}' file '{entry.get('name')}' has a relDir "
+            f"that is not inside the state directory: {rel!r}")
+    return os.path.join(state_dir, rel, entry["name"])
+
+
+def generator_dir(state_dir: str, gen: dict, entry: dict) -> str:
+    """The directory a generator's files share, for removing a complete set."""
+    return os.path.dirname(generator_file(state_dir, gen, entry))
+
+
+def read_generated(state_dir: str, gen: dict) -> dict[str, str]:
+    """The secret half of an already-generated generator, keyed `<name>/<file>`."""
+    values: dict[str, str] = {}
+    for entry in gen["files"]:
+        if not entry.get("secret", True):
+            continue
+        path = generator_file(state_dir, gen, entry)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as handle:
+            values[f"{gen['name']}/{entry['name']}"] = handle.read().strip()
+    return values
+
+
+def run_generators(manifest: str, state_dir: str | None) -> tuple[dict[str, str], list[str]]:
+    """Run the generators that have not run yet: secret values, published paths.
+
+    This is the declarative half of `--secret-generator`: instead of one command
+    per secret name, the configuration says which script produces which files,
+    and this runs it once. A generator whose files all exist is *read*, never
+    re-run -- running a key generator on every deploy would renumber every
+    tunnel it touches, and the peer that already has the old key would go on
+    using it.
+
+    A generator with only some of its files present is a hard error rather than
+    a re-run, for the same reason: the files it did write are the half that
+    something else already depends on.
+    """
+    if not state_dir:
+        raise ToolError(
+            "--generators needs --generator-state-dir: generated values have to "
+            "be kept somewhere, or the next deploy mints a second key for the "
+            "same tunnel")
+    values: dict[str, str] = {}
+    published: list[str] = []
+    for gen in load_generator_manifest(manifest):
+        name = gen["name"]
+        present = [
+            entry["name"] for entry in gen["files"]
+            if os.path.isfile(generator_file(state_dir, gen, entry))
+        ]
+        declared = [entry["name"] for entry in gen["files"]]
+        if len(present) == len(declared):
+            values.update(read_generated(state_dir, gen))
+            published.extend(
+                generator_file(state_dir, gen, entry)
+                for entry in gen["files"] if not entry.get("secret", True)
+            )
+            continue
+        if present:
+            missing = sorted(set(declared) - set(present))
+            # The whole set goes, not the missing half: a generator's files are
+            # one value in several spellings (a private key and its public key),
+            # so keeping the survivors would keep peers pointed at a key whose
+            # private half is about to be replaced.
+            for entry in gen["files"]:
+                shutil.rmtree(generator_dir(state_dir, gen, entry), ignore_errors=True)
+            raise ToolError(
+                f"generator '{name}' is half-generated under {state_dir} (missing: "
+                f"{', '.join(missing)}); its remaining files were removed so the "
+                "next run starts a complete set -- the peers using the old ones "
+                "need the new public key")
+        fresh, fresh_published = run_generator(state_dir, gen)
+        values.update(fresh)
+        published.extend(fresh_published)
+    return values, published
+
+
+def run_generator(state_dir: str, gen: dict) -> tuple[dict[str, str], list[str]]:
+    """Run one generator's script and keep what it wrote under `$out`."""
+    name = gen["name"]
+    workdir = tempfile.mkdtemp(prefix=f"nix-mikrotik-{name}-")
+    try:
+        out = os.path.join(workdir, "out")
+        os.makedirs(out, mode=0o700)
+        env = dict(os.environ)
+        env["out"] = out
+        # The tool's own PATH is not the generator's: `runtimeInputs` is what the
+        # configuration says the script needs, and it comes first so a package
+        # named there wins over whatever the deploying host happens to have.
+        runtime_inputs = gen.get("runtimeInputs") or []
+        if runtime_inputs:
+            env["PATH"] = ":".join(os.path.join(p, "bin") for p in runtime_inputs) + ":" + env.get("PATH", "")
+        proc = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", gen["script"]],
+            capture_output=True, text=True, env=env)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            raise ToolError(
+                f"generator '{name}' failed (exit {proc.returncode})"
+                + ("\n" + detail[0] if detail else ""))
+        missing = [
+            entry["name"] for entry in gen["files"]
+            if not os.path.isfile(os.path.join(out, entry["name"]))
+        ]
+        if missing:
+            raise ToolError(
+                f"generator '{name}' declares {', '.join(missing)} but its script "
+                f"did not write {'them' if len(missing) > 1 else 'it'} under $out")
+        values: dict[str, str] = {}
+        published: list[str] = []
+        for entry in gen["files"]:
+            secret = entry.get("secret", True)
+            destination = generator_file(state_dir, gen, entry)
+            os.makedirs(os.path.dirname(destination), mode=0o700, exist_ok=True)
+            shutil.copyfile(os.path.join(out, entry["name"]), destination)
+            # A generated secret is as sensitive as one that was read from a
+            # clan var; a published one is meant to be read by everyone.
+            # clan's modes: a var is 0400 and world-unreadable, a value another
+            # machine has to read is 0444. Nothing here is writable, because a
+            # generated file is a fact about a key that already has a peer --
+            # editing one in place would leave the peer holding a stale copy.
+            os.chmod(destination, 0o400 if secret else 0o444)
+            if secret:
+                with open(destination, "r", encoding="utf-8") as handle:
+                    values[f"{name}/{entry['name']}"] = handle.read().strip()
+            else:
+                published.append(destination)
+                print(f"published {destination}", file=sys.stderr)
+        return values, published
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def read_secret_command(template: str, names: list[str]) -> dict[str, str]:
@@ -450,6 +664,7 @@ def _secretize(
     sops_key_file: str | None = None,
     secret_generator: str | None = None,
     generator_state_dir: str | None = None,
+    generators: str | None = None,
 ) -> tuple[str, list[str]]:
     with open(script, "r", encoding="utf-8") as handle:
         text = handle.read()
@@ -470,6 +685,12 @@ def _secretize(
     if missing and sops_file:
         values.update(read_sops_secrets(sops_file, missing, sops_key_file))
         missing = []
+    if missing and generators:
+        # Before the per-name generator: the manifest says which script mints
+        # which files, so it is the one that can mint a value *and* the public
+        # key that has to be handed to the peer.
+        values.update(run_generators(generators, generator_state_dir)[0])
+        missing = [n for n in names if n not in values]
     if missing and secret_generator:
         values.update(generate_secrets(secret_generator, missing, generator_state_dir))
         missing = []
@@ -481,12 +702,26 @@ def _secretize(
     if missing:
         raise ToolError(
             "unresolved secret placeholders: " + ", ".join(missing) +
-            "\npass them with --secret NAME=PATH, --secrets-dir, --sops-file, --secret-generator or --secret-command")
+            "\npass them with --secret NAME=PATH, --secrets-dir, --sops-file, "
+            "--generators, --secret-generator or --secret-command")
     return substitute(text, values), names
 
 
+def cmd_generate(args: argparse.Namespace) -> int:
+    values, published = run_generators(args.manifest, args.state_dir)
+    for name in sorted(values):
+        print(name)
+    for path in published:
+        # Printed so the caller can hand the public half over (or commit it)
+        # without having to know where a state directory keeps it.
+        print(f"published {path}")
+    if not values and not published:
+        print("(the generators had nothing to produce)", file=sys.stderr)
+    return 0
+
+
 def cmd_secretize(args: argparse.Namespace) -> int:
-    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir, args.generators)
     destination = args.output
     # 0600 from creation *and* afterwards: the mode passed to os.open applies
     # only when the file is created, so secretizing into a destination that
@@ -586,7 +821,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             "pass --yes to confirm")
 
     router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
-    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir)
+    text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir, args.generators)
 
     if args.dry_run:
         print(f"would deploy {len(text)} bytes with {len(names)} secret(s) to "
@@ -702,6 +937,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("script")
     p.set_defaults(func=cmd_list_secrets)
 
+    p = sub.add_parser("generate", help="run a configuration's secret generators")
+    p.add_argument("manifest", help="generator manifest JSON (a flake's mikrotik-<name>-generators)")
+    p.add_argument("--state-dir", required=True, metavar="DIR",
+                   help="where generated values are kept, in clan's layout: each "
+                        "file goes to the relDir the manifest gives it "
+                        "(per-machine/<router>/<generator>/, shared/<generator>/), "
+                        "0400 for a secret and 0444 for a published value")
+    p.set_defaults(func=cmd_generate)
+
     p = sub.add_parser("secretize", help="substitute secret values into a copy")
     p.add_argument("script")
     p.add_argument("-o", "--output", required=True)
@@ -719,6 +963,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sops-key-file", metavar="PATH",
                    help="sops key to decrypt with (sets SOPS_AGE_KEY_FILE); default: "
                         "sops' own discovery")
+    p.add_argument("--generators", metavar="PATH",
+                   help="generator manifest JSON (a flake's mikrotik-<name>-generators): "
+                        "run the generators that have not run yet, then substitute "
+                        "their files; needs --generator-state-dir")
     p.add_argument("--secret-command", metavar="CMD",
                    help="run CMD per unresolved secret ({name} substituted), "
                         "using its stdout instead of reading files")
@@ -748,6 +996,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sops-key-file", metavar="PATH",
                    help="sops key to decrypt with (sets SOPS_AGE_KEY_FILE); default: "
                         "sops' own discovery")
+    p.add_argument("--generators", metavar="PATH",
+                   help="generator manifest JSON (a flake's mikrotik-<name>-generators): "
+                        "run the generators that have not run yet, then substitute "
+                        "their files; needs --generator-state-dir")
     p.add_argument("--secret-command", metavar="CMD",
                    help="run CMD per unresolved secret ({name} substituted), "
                         "using its stdout instead of reading files")

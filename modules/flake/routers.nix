@@ -56,14 +56,27 @@ let
   # have nowhere to put either.
   evaluated = lib.mapAttrs
     (name: file:
-      (mt.evalMikrotikFleet {
+      (mt.evalMikrotikFleetConfigs {
         modules = [ { mikrotik.routers.${name} = file; } ] ++ cfg.extraModules;
+        inherit (cfg) pkgs specialArgs;
       }).${name})
     moduleFiles;
 
   # Routers a clan service contributed: one module holding
-  # `mikrotik.routers.<name>`, rendered per name.
-  fromServices = mt.evalMikrotikFleet { modules = cfg.extraModules; };
+  # `mikrotik.routers.<name>`, evaluated per name.
+  fromServices = mt.evalMikrotikFleetConfigs {
+    modules = cfg.extraModules;
+    inherit (cfg) pkgs specialArgs;
+  };
+
+  # What a consumer reads: the script to send, and the generators that have to
+  # run before it can be sent (their placeholders are what it contains).
+  rendered = lib.mapAttrs
+    (_: router: {
+      script = mt.renderConfig router;
+      generators = mt.generators router;
+    })
+    (evaluated // fromServices);
 in
 {
   options.mikrotik.routers = {
@@ -91,6 +104,32 @@ in
         `evalMikrotikFleet` renders it.
       '';
     };
+
+    pkgs = lib.mkOption {
+      type = lib.types.attrs;
+      description = ''
+        The package set handed to every router as the `pkgs` module argument, and
+        to the evaluator as a required one. A router declares a generator with
+        `runtimeInputs = [ pkgs.… ]`, so the values that end up in the script are
+        built from a real package set, not resolved lazily at deploy time.
+
+        There is no default and no null: evaluating a router without `pkgs` would
+        only postpone the failure to a generator that needs a tool, so the
+        flake does not offer that shape at all. Set it from `perSystem`
+        (`mikrotik.routers.pkgs = pkgs;` inside `perSystem`, or
+        `mkDefault inputs.nixpkgs.legacyPackages.<system>.pkgs` at flake level).
+      '';
+    };
+
+    specialArgs = lib.mkOption {
+      type = lib.types.attrsOf lib.types.anything;
+      default = { };
+      description = ''
+        Extra module arguments for every router, on top of `mkSecret` and `pkgs`
+        -- for a router module that wants, say, its address plan handed in rather
+        than imported.
+      '';
+    };
   };
 
   config = lib.mkMerge [
@@ -98,16 +137,20 @@ in
       # One definition for both sources: a directory router and a service
       # contribution are two ways to fill the same output, and two assignments
       # would collide rather than merge.
-      flake.mikrotikConfigurations = lib.mapAttrs
-        (_: script: { inherit script; })
-        (evaluated // fromServices);
+      flake.mikrotikConfigurations = rendered;
     })
 
     (lib.mkIf (cfg.directory != null || cfg.extraModules != [ ]) {
       perSystem = { pkgs, ... }: {
         packages = lib.mapAttrs'
-          (name: script: lib.nameValuePair "mikrotik-${name}" (pkgs.writeTextDir "router-config.rsc" script))
-          (lib.mapAttrs (_: r: r.script) config.flake.mikrotikConfigurations);
+          (name: router: lib.nameValuePair "mikrotik-${name}" (pkgs.writeTextDir "router-config.rsc" router.script))
+          rendered
+        // lib.mapAttrs'
+          # The manifest `nix-mikrotik generate` and `--generators` read. A
+          # package rather than a string so a deploy unit can name it like any
+          # other path, and so `nix build .#mikrotik-<name>-generators` prints it.
+          (name: router: lib.nameValuePair "mikrotik-${name}-generators" (pkgs.writeText "${name}-generators.json" (builtins.toJSON router.generators)))
+          rendered;
       };
     })
   ];

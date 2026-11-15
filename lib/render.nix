@@ -52,6 +52,17 @@ let
   # values that are already fine unquoted (addresses, lists, names).
   needsQuote = s: builtins.match ''.*[ =;"\\$].*'' s != null;
 
+  # RouterOS spells a list-valued argument as one comma-separated string --
+  # `allowed-address=0.0.0.0/0,::/0`, `servers=1.1.1.1,8.8.8.8`,
+  # `interfaces=wg0,wg1`. Writing the argument as a Nix list is the whole point
+  # of accepting a list in a cell: the join happens here, in the one place that
+  # knows RouterOS syntax, instead of every configuration building the string by
+  # hand and getting the separator or the spacing wrong.
+  cellText = v:
+    if isList v then concatStringsSep "," (map cellText v)
+    else if isSecret v then placeholder v.__mikrotikSecret
+    else scalar v;
+
   formatValue = key: value:
     if isSecret value then
       # The placeholder goes in *bare*, and the deploy tool decides how the
@@ -68,6 +79,14 @@ let
       # renders as `a=b` rather than `no_label=a=b`. It is how a menu that
       # takes `set` arguments as one line is written upstream.
       formatValue null value
+    else if isList value then
+      let joined = cellText value;
+      in if key == null then
+        (if needsQuote joined then quoted joined else joined)
+      else if needsQuote joined then
+        "${key}=${quoted joined}"
+      else
+        "${key}=${joined}"
     else if isAttrs value && key != null then
       concatStringsSep " " ([ key ] ++ mapAttrsToList (k: v: formatValue k v) value)
     else if isAttrs value then

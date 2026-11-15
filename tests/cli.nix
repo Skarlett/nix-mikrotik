@@ -90,6 +90,140 @@ pkgs.runCommand "check-cli" { } ''
   fi
   grep -q 'unresolved secret placeholders: wifi-password' err
 
+  # -------------------------------------------------- declared generators ----
+  # A configuration can say which script mints its secrets instead of the
+  # deployer holding files. The manifest is what `lib.generators` renders and
+  # what a flake publishes as `mikrotik-<router>-generators`; `generate` runs it
+  # once, `secretize --generators` runs it if needed and substitutes the result.
+  # The script here is pure shell so the check needs nothing but a shell.
+  #
+  # Each file carries the clan `relDir` it belongs at, and the tool writes it
+  # there and nowhere else -- so a state directory this check builds is
+  # byte-for-byte the layout `clan vars get` reads.
+  cat > generators.json <<'EOF'
+  [
+    {
+      "name": "wg-test-key",
+      "files": [
+        { "name": "privkey", "secret": true,  "relDir": "per-machine/chr-1/wg-test-key" },
+        { "name": "pubkey",  "secret": false, "relDir": "shared/wg-test-key" }
+      ],
+      "runtimeInputs": [],
+      "script": "printf 'sekret-key\\n' > $out/privkey; printf 'public-key\\n' > $out/pubkey"
+    }
+  ]
+  EOF
+
+  $cli generate generators.json --state-dir state > generated
+  grep -qx 'wg-test-key/privkey' generated
+  # The secret half lands under the router's own tree at 0400, the published
+  # half in the shared tree at 0444 -- clan's modes, because clan's layout is
+  # what a var store holds.
+  [ "$(stat -c %a state/per-machine/chr-1/wg-test-key/privkey)" = "400" ]
+  [ "$(stat -c %a state/shared/wg-test-key/pubkey)" = "444" ]
+  grep -qx 'sekret-key' state/per-machine/chr-1/wg-test-key/privkey
+  grep -qx 'public-key' state/shared/wg-test-key/pubkey
+  # The published path is reported, so the caller can hand the public half over
+  # without knowing where the state directory keeps it.
+  grep -qxF 'published state/shared/wg-test-key/pubkey' generated
+
+  cat > gen-router.rsc <<'EOF'
+  /interface wireguard
+  set name=wg.9600-baud.net private-key=__MIKROTIK_SECRET_wg-test-key/privkey__
+  EOF
+
+  # A generated value is substituted the same way a read one is ...
+  $cli secretize gen-router.rsc -o gen-out.rsc --generators generators.json --generator-state-dir state
+  grep -q 'private-key=sekret-key' gen-out.rsc
+
+  # ... and the second run reads the value it minted, rather than minting a new
+  # key that the peer already holding the old public key would not know.
+  $cli generate generators.json --state-dir state > /dev/null
+  grep -qx 'sekret-key' state/per-machine/chr-1/wg-test-key/privkey
+
+  # A generator has to be kept somewhere: without a state directory there is
+  # nowhere to put the value the next run would read.
+  if $cli generate generators.json 2>err-state; then
+    echo "generate ran without a state directory" >&2
+    exit 1
+  fi
+  grep -q -- '--state-dir' err-state
+
+  # Half a generator on disk is refused, not re-run and not topped up: the file
+  # it did write is the half something else may already depend on. The two files
+  # sit in two different trees here, so this also checks that the refusal clears
+  # both of them rather than the one it happened to look at first.
+  mkdir -p half/per-machine/chr-1/wg-test-key
+  printf 'x' > half/per-machine/chr-1/wg-test-key/privkey
+  if $cli generate generators.json --state-dir half 2>err-half; then
+    echo "generate accepted a half-generated generator" >&2
+    exit 1
+  fi
+  grep -q 'half-generated' err-half
+  [ ! -e half/per-machine/chr-1/wg-test-key ]
+  [ ! -e half/shared/wg-test-key ]
+
+  # A script that does not write a file it declared is caught before anything is
+  # kept -- otherwise the next run reads a directory that looks generated.
+  cat > bad-generators.json <<'EOF'
+  [
+    {
+      "name": "short-key",
+      "files": [
+        { "name": "privkey", "relDir": "per-machine/chr-1/short-key" },
+        { "name": "pubkey",  "relDir": "per-machine/chr-1/short-key" }
+      ],
+      "runtimeInputs": [],
+      "script": "printf 'x\\n' > $out/privkey"
+    }
+  ]
+  EOF
+  if $cli generate bad-generators.json --state-dir badstate 2>err-short; then
+    echo "generate accepted a script that skipped a declared file" >&2
+    exit 1
+  fi
+  grep -q 'did not write' err-short
+  [ ! -e badstate/per-machine/chr-1/short-key ]
+
+  # A manifest that does not say where a file belongs is refused: a default
+  # would be a second spelling of the layout, and the two would drift into the
+  # tool reading a value from a path clan never wrote.
+  cat > norel-generators.json <<'EOF'
+  [
+    {
+      "name": "no-dir",
+      "files": [ { "name": "privkey", "secret": true } ],
+      "runtimeInputs": [],
+      "script": "printf 'x\\n' > $out/privkey"
+    }
+  ]
+  EOF
+  if $cli generate norel-generators.json --state-dir norelstate 2>err-norel; then
+    echo "generate accepted a file with no relDir" >&2
+    exit 1
+  fi
+  grep -q 'no relDir' err-norel
+
+  # A relDir that points out of the state directory is refused before anything
+  # is written, for the same reason the secret-file lookup refuses it: the state
+  # directory is a boundary, not a suggestion.
+  cat > escape-generators.json <<'EOF'
+  [
+    {
+      "name": "escape",
+      "files": [ { "name": "privkey", "secret": true, "relDir": "../outside" } ],
+      "runtimeInputs": [],
+      "script": "printf 'x\\n' > $out/privkey"
+    }
+  ]
+  EOF
+  if $cli generate escape-generators.json --state-dir escstate 2>err-esc; then
+    echo "generate accepted a relDir outside the state directory" >&2
+    exit 1
+  fi
+  grep -q 'not inside the state directory' err-esc
+  [ ! -e outside/privkey ]
+
   # ---------------------------------------------------------------- names ----
   # The name is also the file name the value is read from, so a name that is not
   # one is refused. This is the half modules/base.nix asserts at build time, for

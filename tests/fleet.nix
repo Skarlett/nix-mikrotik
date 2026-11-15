@@ -1,4 +1,4 @@
-{ pkgs, evalMikrotik, evalMikrotikFleet, evalMikrotikRaw, mkSecret }:
+{ pkgs, evalMikrotik, evalMikrotikFleet, evalMikrotikFleetConfigs, evalMikrotikRaw, generators, mkSecret }:
 
 # The fleet form: several routers declared side by side must not collide.
 #
@@ -6,51 +6,68 @@
 # contributes the module of the router it manages. A router is a configuration of
 # its own -- a separate device -- so each entry is a *module* and is evaluated on
 # its own; this proves the claim that makes: routers compose instead of
-# overwriting each other, each script keeps its own identity and secrets, the
-# typed menu surface is written the same way inside a router as outside, and a
-# broken router fails the evaluation of that router rather than of the fleet.
+# overwriting each other, each script keeps its own identity and secrets, its
+# generated values are filed under its own name, the typed menu surface is
+# written the same way inside a router as outside, and a broken router fails the
+# evaluation of that router rather than of the fleet.
 let
   lib = pkgs.lib;
 
-  fleet = evalMikrotikFleet {
-    modules = [
+  # chr1 mints a key; its menu cell holds the placeholder, not a value.
+  chr1 = { config, ... }: {
+    mikrotik.hostname = "gw.chr1.luninet.org";
+    # The typed menu surface, inside a router: the same option tree a lone
+    # router carries, not a second spelling of the same menu.
+    mikrotik.interface.wireguard.items = [
       {
-        mikrotik.routers.chr1 = {
-          mikrotik.hostname = "gw.chr1.luninet.org";
-          mikrotik.secrets.wg-key.file = "chr1-wg-key";
-          # The typed menu surface, inside a router: the same option tree a lone
-          # router carries, not a second spelling of the same menu.
-          mikrotik.interface.wireguard.items = [
-            {
-              name = "wg.test";
-              private-key = mkSecret "wg-key";
-            }
-          ];
-        };
+        name = "wg.test";
+        private-key = config.clan.core.vars.generators.wg-key.files.privkey.placeholder;
       }
+    ];
+    clan.core.vars.generators.wg-key = {
+      files.privkey = { };
+      files.pubkey.secret = false;
+      script = "wg genkey | tee $out/privkey | wg pubkey > $out/pubkey";
+    };
+  };
+
+  # chr2 declares a generator of the same name. The two must land in different
+  # var directories: that is what `routerName` buys, and what would quietly
+  # break if it defaulted to the hostname of whichever router was evaluated.
+  chr2 = {
+    mikrotik.hostname = "gw.chr2.luninet.org";
+    mikrotik.sections."/ip dns".servers = "1.1.1.1";
+    clan.core.vars.generators.wg-key = {
+      files.privkey = { };
+      script = "wg genkey > $out/privkey";
+    };
+  };
+
+  fleetModule = {
+    mikrotik.routers.chr1 = chr1;
+    mikrotik.routers.chr2 = chr2;
+    # Two modules for one router merge into it, which is how one service
+    # contributes the router and another (the address space, say) contributes
+    # a slice of the same router.
+    mikrotik.routers.chr3.mikrotik.hostname = "gw.chr3.luninet.org";
+    mikrotik.routers.chr3.mikrotik.ip.address = [
       {
-        mikrotik.routers.chr2 = {
-          mikrotik.hostname = "gw.chr2.luninet.org";
-          mikrotik.sections."/ip dns".servers = "1.1.1.1";
-        };
-      }
-      # Two modules for one router merge into it, which is how one service
-      # contributes the router and another (the address space, say) contributes
-      # a slice of the same router.
-      { mikrotik.routers.chr3.mikrotik.hostname = "gw.chr3.luninet.org"; }
-      {
-        mikrotik.routers.chr3.mikrotik.ip.address = [
-          {
-            address = "10.9.0.1/24";
-            interface = "ether1";
-          }
-        ];
+        address = "10.9.0.1/24";
+        interface = "ether1";
       }
     ];
   };
 
+  fleet = evalMikrotikFleet { inherit pkgs; modules = [ fleetModule ]; };
+
+  # Each router's generators, as the deploy tool would read them.
+  fleetConfigs = evalMikrotikFleetConfigs { inherit pkgs; modules = [ fleetModule ]; };
+  relDirs = name:
+    lib.unique (lib.concatMap (g: map (f: f.relDir) g.files) (generators fleetConfigs.${name}));
+
   # The single-router form is untouched by the fleet option.
   single = evalMikrotik {
+    inherit pkgs;
     modules = [
       {
         mikrotik.hostname = "lonely";
@@ -65,6 +82,7 @@ let
   brokenFleet = builtins.tryEval (
     builtins.concatStringsSep "" (builtins.attrValues (
       evalMikrotikFleet {
+        inherit pkgs;
         modules = [
           {
             mikrotik.routers.wrong.mikrotik.sections."/interface wireguard" = [
@@ -81,7 +99,7 @@ let
 
   refusals = [
     {
-      name = "a router with an unpaired secret";
+      name = "a router with an unpaired placeholder";
       modules = [
         {
           mikrotik.sections."/interface wireguard" = [
@@ -92,7 +110,7 @@ let
           ];
         }
       ];
-      expect = "mikrotik.secrets";
+      expect = "has no matching file";
     }
     {
       name = "a router with a /system identity section";
@@ -115,7 +133,7 @@ let
   refusalResults = map
     (r:
       let
-        plan = evalMikrotikRaw { inherit (r) modules; };
+        plan = evalMikrotikRaw { inherit (r) modules pkgs; };
         messages = map (a: a.message) plan.failed;
       in
       {
@@ -126,6 +144,8 @@ let
     refusals;
 
   failedRefusals = map (r: r.name) (builtins.filter (r: !r.ok) refusalResults);
+
+  chr1KeyFile = builtins.head (builtins.head (generators fleetConfigs.chr1)).files;
 in
 # A refusal that does not fire is the failure mode this whole test exists for:
   # it is checked at evaluation, where the diagnostic is readable.
@@ -158,8 +178,14 @@ pkgs.runCommandLocal "mikrotik-fleet" { } ''
   ! grep -q 'gw.chr1' $out/chr2.rsc
 
   # A secret belongs to the router that declared it.
-  grep -q 'private-key=__MIKROTIK_SECRET_wg-key__' $out/chr1.rsc
+  grep -q 'private-key=__MIKROTIK_SECRET_wg-key/privkey__' $out/chr1.rsc
   ! grep -q 'wg-key' $out/chr2.rsc
+
+  # Two routers declaring a generator of the same name file it under their own
+  # keys, not under whichever hostname came last.
+  [ ${lib.escapeShellArg chr1KeyFile.relDir} = 'per-machine/chr1/wg-key' ]
+  [ ${lib.escapeShellArg (lib.concatStringsSep " " (relDirs "chr1"))} = 'per-machine/chr1/wg-key' ]
+  [ ${lib.escapeShellArg (lib.concatStringsSep " " (relDirs "chr2"))} = 'per-machine/chr2/wg-key' ]
 
   # Each keeps its own sections.
   grep -q 'servers=1.1.1.1' $out/chr2.rsc

@@ -13,9 +13,29 @@
 # `hardening.nix` is imported exactly as it is in the other file, and it still
 # writes `mikrotik.sections`: a module written for the old spelling keeps
 # working, and the two spellings merge in one configuration.
-{ mkSecret, ... }:
+{ config, pkgs, ... }:
 {
   imports = [ ../modules/hardening.nix ];
+
+  # Exactly the generators `module-configuration.nix` declares -- same names,
+  # same files, same placeholders -- because this file's whole job is to render
+  # the same script.
+  clan.core.vars.generators = {
+    wg-private-key = {
+      files.privkey.secret = true;
+      runtimeInputs = [ pkgs.wireguard-tools ];
+      script = "wg genkey > $out/privkey";
+    };
+    wifi-password = {
+      files.passphrase = { };
+      prompts.passphrase = {
+        description = "WPA2 passphrase for the `wifi` bridge";
+        type = "hidden";
+        persist = true;
+      };
+      script = "";
+    };
+  };
 
   mikrotik = {
     hostname = "nidas";
@@ -34,17 +54,6 @@
       "/ip firewall filter"
       "/ip firewall nat"
     ];
-
-    secrets = {
-      wifi-password = {
-        description = "WPA2 passphrase for the `wifi` bridge";
-        file = "wifi-password";
-      };
-      wg-private-key = {
-        description = "WireGuard private key for wg.luninet";
-        file = "wg-private-key";
-      };
-    };
 
     interface = {
       # `/interface bridge` also has `/interface bridge port` below it, so the
@@ -75,7 +84,7 @@
           name = "wg.luninet";
           listen-port = 57676;
           mtu = 1420;
-          private-key = mkSecret "wg-private-key";
+          private-key = config.clan.core.vars.generators.wg-private-key.files.privkey.placeholder;
         }
       ];
 
@@ -94,7 +103,7 @@
         {
           name = "default";
           authentication-types = "wpa2-psk";
-          passphrase = mkSecret "wifi-password";
+          passphrase = config.clan.core.vars.generators.wifi-password.files.passphrase.placeholder;
         }
       ];
     };

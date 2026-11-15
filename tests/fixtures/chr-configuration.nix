@@ -27,7 +27,7 @@
 # `/ip service set www disabled=yes`, which turns off the REST API this check
 # reads the device back through. `checks.render` covers that module's lines;
 # deploying them would cost the check its independent view of the device.
-{ mkSecret, ... }:
+{ config, ... }:
 {
   mikrotik = {
     hostname = "chr-deploy";
@@ -47,17 +47,6 @@
       "/ip dns static"
       "/interface wireguard"
     ];
-
-    secrets = {
-      wg-private-key = {
-        description = "throwaway WireGuard key; the check passes 32 bytes of `A`";
-        file = "wg-private-key";
-      };
-      dns-comment = {
-        description = ''a value carrying `"`, `\` and `$`, to read back escaped'';
-        file = "dns-comment";
-      };
-    };
 
     sections = {
       # No member ports: a bridge with `auto-mac=no` and no ports has no MAC to
@@ -96,7 +85,7 @@
           name = "chr-deploy.lan";
           address = "192.168.88.1";
           # A secret in a place the device reads back verbatim.
-          comment = mkSecret "dns-comment";
+          comment = config.clan.core.vars.generators.dns.files.comment.placeholder;
         }
       ];
 
@@ -123,10 +112,35 @@
       # The secret-bearing interface: `private-key=` is filled in at deploy
       # time, and an unquoted base64 value would abort the entire script.
       "/interface wireguard" = [
-        { name = "wg.check"; listen-port = 51820; mtu = 1420; private-key = mkSecret "wg-private-key"; }
+        { name = "wg.check"; listen-port = 51820; mtu = 1420; private-key = config.clan.core.vars.generators.wg.files.private-key.placeholder; }
       ];
 
       "/system clock" = { time-zone-name = "UTC"; };
     };
+  };
+
+  # Two generators, because a generator is the unit clan generates: one mints
+  # the key the interface needs, one holds the value that is read back out of
+  # a comment. Neither is run by this check -- the values are handed to
+  # `deploy` on the command line -- but a placeholder with no declaration is
+  # refused at evaluation, which is the point of declaring them here.
+  #
+  # Declared next to `mikrotik`, not inside it: `clan.core.*` is not a
+  # RouterOS menu, and `mikrotik` refuses an option it does not know.
+  clan.core.vars.generators.wg = {
+    files.private-key = { };
+    script = "wg genkey > $out/private-key";
+  };
+  clan.core.vars.generators.dns = {
+    files.comment = { };
+    # A persisted prompt *is* a file of the generator: the deploy tool copies
+    # it from `$prompts` to `$out`, so this generator needs no script of its
+    # own. It is how a value a human knows but the machine cannot mint is
+    # declared.
+    prompts.comment = {
+      description = "the value the harness supplies";
+      persist = true;
+    };
+    script = "";
   };
 }

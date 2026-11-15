@@ -7,18 +7,21 @@
 # renderer cannot tell which spelling produced the value it is handed.
 { lib }:
 let
-  inherit (lib) isAttrs isBool isInt isString types;
+  inherit (lib) isAttrs isBool isInt isList isString types;
 
   # What RouterOS accepts as one `key=value`: a string, an integer, a boolean, a
   # secret marker (an attrset that renders as a placeholder rather than a
-  # value), or a nested attrset, which renders as an argument group -- the
-  # `no_label` spelling upstream uses for a `set` line with several arguments.
+  # value), a list (which renders as one comma-separated argument: RouterOS
+  # spells `allowed-address`, `servers` and `interfaces` that way), or a nested
+  # attrset, which renders as an argument group -- the `no_label` spelling
+  # upstream uses for a `set` line with several arguments.
   #
   # The check is a courtesy, not a source of truth: `lib/render.nix` still
   # decides what it can print, and anything that slips through fails there with
   # the message about an unsupported scalar.
   isCell = v:
     isString v || isBool v || isInt v
+    || (isList v && lib.all isCell v)
     || (isAttrs v && (v ? __mikrotikSecret || lib.all isCell (lib.attrValues v)));
 
   cell = types.addCheck types.anything isCell // {
