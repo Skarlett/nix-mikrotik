@@ -182,6 +182,35 @@ let
   controlConfig = evalMikrotik { inherit pkgs; modules = [ control ]; };
   controlHostname = controlConfig.mikrotik.hostname;
 
+  # A value this router does not mint at all: a key its controller generated.
+  # `varFiles` names it so the "is this placeholder declared?" assertion can
+  # tell a real hand-off from a typo, and the value is read from `--secrets-dir`
+  # at deploy time rather than from a generator manifest entry.
+  varFileModule = { mkSecret, ... }: {
+    mikrotik = {
+      hostname = "router2";
+      varFiles."mesh-chr1-private-key".description = "chr1's key, minted on its controller";
+      sections."/interface wireguard" = [
+        { name = "wg0"; private-key = mkSecret "mesh-chr1-private-key"; }
+      ];
+    };
+  };
+  varFileConfig = evalMikrotik { inherit pkgs; modules = [ varFileModule ]; };
+  varFileDeclared = builtins.attrNames varFileConfig.mikrotik.varFiles;
+  varFileGenerated = generators varFileConfig;
+  # ... and it is still a placeholder a typo cannot slip past.
+  varFileTypoRefused = refused [
+    ({ mkSecret, ... }: {
+      mikrotik = {
+        hostname = "router2";
+        varFiles."mesh-chr1-private-key".description = "chr1's key";
+        sections."/interface wireguard" = [
+          { name = "wg0"; private-key = mkSecret "mesh-chr1-rpivate-key"; }
+        ];
+      };
+    })
+  ];
+
   # The generator list is in dependency order and carries each file's place in
   # the var store, which is what the deploy tool runs on. `wg-key` is declared
   # first and `peer-key` depends on it, so the order is already right -- the
@@ -247,6 +276,21 @@ pkgs.runCommand "check-eval" { } ''
     exit 1
   }
   printf 'pkgs | argument | %s, specialArgs extends but cannot override\n' ${lib.escapeShellArg pkgsSystem} >> $out/refusals.txt
+
+  # -- a value generated elsewhere is declared, not minted here --------------
+  [ ${lib.escapeShellArg (lib.concatStringsSep "," varFileDeclared)} = 'mesh-chr1-private-key' ] || {
+    echo "varFiles did not declare the hand-off: ${lib.concatStringsSep "," varFileDeclared}" >&2
+    exit 1
+  }
+  [ -z ${lib.escapeShellArg (lib.concatStringsSep "," (map (g: g.name) varFileGenerated))} ] || {
+    echo "a varFiles entry reached the generator manifest" >&2
+    exit 1
+  }
+  [ ${if varFileTypoRefused then "0" else "1"} -eq 0 ] || {
+    echo "a typo against varFiles was not refused" >&2
+    exit 1
+  }
+  printf 'varFiles | declared | %s, no generator, typo refused\n' ${lib.escapeShellArg (lib.concatStringsSep "," varFileDeclared)} >> $out/refusals.txt
 
   # -- every assertion fires, with a diagnostic that names the fix ----------
   ${lib.concatMapStrings (r: ''

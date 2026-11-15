@@ -95,6 +95,36 @@ let
       description = "Raw RouterOS lines appended verbatim. The escape hatch.";
     };
 
+    # A secret this router does not mint: it was generated somewhere else (a
+    # clan machine's generator, typically the controller that owns the tunnel)
+    # and the deploy tool only has to read it out of `--secrets-dir`. Naming it
+    # here is what separates "the value exists elsewhere" from "the value does
+    # not exist at all" -- and the failure mode being guarded against is a typo
+    # in a `mkSecret` call, which is silent unless the name is known in advance.
+    varFiles = mkOption {
+      type = types.attrsOf (types.submodule {
+        options.description = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "What the value is, for generated documentation.";
+        };
+      });
+      default = { };
+      example = literalExpression ''
+        { "mesh-chr1-private-key".description = "chr1's key, minted on the controller"; }
+      '';
+      description = ''
+        Secret values that are not produced by this router's own generators,
+        keyed by the name a menu cell references with `mkSecret`.
+
+        The attribute name is both the placeholder name and the file name under
+        the deploy tool's `--secrets-dir`, because the tool joins them directly.
+        Prefer a `clan.core.vars.generators` declaration whenever the value can
+        be minted at deploy time; this option is for a key another host already
+        owns, such as a router's WireGuard key generated on its controller.
+      '';
+    };
+
     routerName = mkOption {
       type = types.str;
       default = config.mikrotik.hostname;
@@ -796,6 +826,8 @@ in
           '';
         }
       ]
-      ++ routerAssertions generatorFiles "mikrotik" cfg;
+      ++ routerAssertions
+        (generatorFiles // lib.genAttrs (lib.attrNames cfg.varFiles) (_: null))
+        "mikrotik" cfg;
   };
 }
