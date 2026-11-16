@@ -27,7 +27,7 @@
 # `/ip service set www disabled=yes`, which turns off the REST API this check
 # reads the device back through. `checks.render` covers that module's lines;
 # deploying them would cost the check its independent view of the device.
-{ config, ... }:
+{ config, pkgs, ... }:
 {
   mikrotik = {
     hostname = "chr-deploy";
@@ -121,14 +121,17 @@
 
   # Two generators, because a generator is the unit clan generates: one mints
   # the key the interface needs, one holds the value that is read back out of
-  # a comment. Neither is run by this check -- the values are handed to
-  # `deploy` on the command line -- but a placeholder with no declaration is
-  # refused at evaluation, which is the point of declaring them here.
+  # a comment. `checks.chr-deploy` runs both -- `nix-mikrotik generate` mints
+  # the key and answers the prompt -- and then holds the device to the result,
+  # which is why the fixture declares them rather than being handed values.
   #
   # Declared next to `mikrotik`, not inside it: `clan.core.*` is not a
   # RouterOS menu, and `mikrotik` refuses an option it does not know.
   clan.core.vars.generators.wg = {
     files.private-key = { };
+    # `wg` is not on a bare PATH: `runtimeInputs` is what the generator's script
+    # is rendered against, so a generator that calls a tool has to name it.
+    runtimeInputs = [ pkgs.wireguard-tools ];
     script = "wg genkey > $out/private-key";
   };
   clan.core.vars.generators.dns = {

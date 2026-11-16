@@ -1,4 +1,4 @@
-{ lib, pkgs, imageFile, nix-mikrotik, harness, script, refusedScript }:
+{ lib, pkgs, imageFile, nix-mikrotik, harness, script, refusedScript, generators }:
 
 # Apply a rendered configuration to a real RouterOS, then read the device back.
 #
@@ -22,11 +22,20 @@
 # `mt.mkRouterScript` the flake ships -- a CHR has one ethernet port, so it is
 # written for that device rather than reusing the examples, which name ether2,
 # ether3, ether5 and sfp1.
+#
+# The values on the two secret lines are not handed to the deploy on the command
+# line: the check runs the configuration's own generators first
+# (`nix-mikrotik generate <manifest> --state-dir`), so the private key is minted
+# by the generator that declares it and the persisted prompt is answered the way
+# an operator answers one. That is the path a consumer takes, and it is what
+# makes the public key on the device an assertion rather than a restatement: the
+# key the interface ends up with has to be the one the minted private key
+# derives.
 let
-  # Obviously fake, and they stay in this file: one is 32 bytes of base64
-  # (`=` padding is what has to be quoted) and one carries the three characters
-  # RouterOS gives meaning to inside a quoted value.
-  wgKey = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=";
+  # The value the persisted prompt is answered with. It stays in this file and is
+  # deliberately awkward -- a quote, a backslash and a `$` -- because it has to
+  # survive the prompt file, the renderer's quoting and the device's parser, and
+  # be read back byte for byte.
   dnsComment = "a\"b\\c$d";
 
   # The runner is a script of its own rather than a string spliced into the
@@ -39,8 +48,9 @@ let
     "--rest-port 8081"
     "--script ${script}/router-config.rsc"
     "--expect-hostname chr-deploy"
-    "--secret ${lib.escapeShellArg "wg/private-key=${wgKey}"}"
-    "--secret ${lib.escapeShellArg "dns/comment=${dnsComment}"}"
+    "--generators ${generators}"
+    "--generator-state-dir /tmp/vars"
+    "--prompt ${lib.escapeShellArg "comment=${dnsComment}"}"
     "--broken-script ${refusedScript}"
     "--cli ${nix-mikrotik}/bin/nix-mikrotik"
   ]);
@@ -60,6 +70,9 @@ pkgs.testers.nixosTest {
       pkgs.qemu
       pkgs.openssh
       pkgs.python3
+      # `wg pubkey`, so the check can derive the public half of the key its
+      # generator minted and hold the device to it.
+      pkgs.wireguard-tools
       nix-mikrotik
     ];
   };

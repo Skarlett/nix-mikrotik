@@ -147,7 +147,7 @@
             # reads: `checks.chr-deploy` mints the router's key from this
             # instead of being handed one, which is the path a consumer takes.
             mikrotik-chr-fixture-generators = pkgs.writeText "chr-fixture-generators.json"
-              (builtins.toJSON (mt.manifest chrFixture.config));
+              (builtins.toJSON (mt.manifest chrFixture));
             # The `routers/` convention as one command. Each router publishes its
             # own manifest; this passes all of them to one `generate` call, so
             # the tool runs the generators in dependency order across the

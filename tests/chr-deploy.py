@@ -18,14 +18,22 @@ The device is a CHR (see `chr/`), never a real router. What this does:
               device without a password.
   baseline    read the device *before* the deploy, so the assertions after it
               are assertions and not coincidence.
-  deploy      `nix-mikrotik deploy <script> --secret … --verify
-              --expect-hostname`, exactly as an operator runs it.
+  mint        `nix-mikrotik generate <manifest> --state-dir DIR`, so the values
+              are produced by the generators the configuration declares rather
+              than made up by this check -- a persisted prompt is answered the
+              way an operator answers one.
+  deploy      `nix-mikrotik deploy <script> --generators <manifest>
+              --generator-state-dir DIR --verify --expect-hostname`, exactly as
+              an operator runs it. `--secret NAME=VALUE` remains for a device
+              whose values this check does have to invent.
   assert      read the device's state back over REST and compare it with what
               the configuration said: the identity, a bridge with an address on
               it, a dhcp-server that draws from a pool created above it, a
               firewall comment containing `$` read back byte for byte, an
-              interface whose line carries a secret, and a *secret* delivered
-              into a comment and read back byte for byte.
+              interface whose line carries a secret, a *secret* delivered into a
+              comment and read back byte for byte, and -- the one only a minted
+              key can support -- a public key on the device that is the one the
+              minted private key derives.
   refusals    deploy a deliberately broken script and require the deploy to
               *fail*, with the device's own log entry as evidence -- otherwise
               the passing case above is indistinguishable from a check that
@@ -38,7 +46,7 @@ written and where every assertion below was first measured:
 
   tests/chr-deploy.py --host 127.0.0.1 --ssh-port 2201 --rest-port 8081 \\
       --script <chr-fixture>/router-config.rsc --expect-hostname chr-deploy \\
-      --secret wg/private-key=<base64> --secret dns/comment=<value> \\
+      --generators <chr-fixture-generators.json> --prompt comment=<value> \\
       --broken-script tests/fixtures/refused.rsc --cli <nix-mikrotik>
 """
 
@@ -282,16 +290,21 @@ def bootstrap(rest: Rest, host: str, ssh_port: int, slirp_host: str,
 
 
 def deploy(cli: str, script: str, host: str, ssh_port: int, key: str,
-           secrets: list[str], workdir: str) -> subprocess.CompletedProcess:
+           secrets: list[str], workdir: str, generators: str | None = None,
+           state_dir: str | None = None) -> subprocess.CompletedProcess:
     """Run the deploy tool the way an operator does, secrets and all.
 
-    `--secret` takes NAME=PATH, so the values are staged as files in this
-    check's private directory: the tool is meant to read them off the deploying
-    machine and never off a command line, and a base64 key or a value carrying
-    `$` is a poor thing to put in argv anyway.
+    With `--generators`, the values come from the state directory the manifest
+    points into -- the path a consumer takes, where nothing on the command line
+    is a secret. Without it, `--secret` takes NAME=VALUE and the values are
+    staged as files in this check's private directory: the tool is meant to read
+    them off the deploying machine and never off a command line, and a base64
+    key or a value carrying `$` is a poor thing to put in argv anyway.
     """
     argv = [cli, "deploy", script, "--host", host, "--port", str(ssh_port),
             "--key", key, "--verify"]
+    if generators:
+        argv += ["--generators", generators, "--generator-state-dir", state_dir]
     for item in secrets:
         name, value = item.split("=", 1)
         # A secret name is `<generator>/<file>`, which is a path, not a file
@@ -325,6 +338,77 @@ def deploy(cli: str, script: str, host: str, ssh_port: int, key: str,
     return proc
 
 
+def load_manifest(path: str) -> list[dict]:
+    """The generators a configuration declares, in the order they must run."""
+    with open(path, "r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    return document.get("generators") or []
+
+
+def generated_file(state_dir: str, gen: dict, entry: dict) -> str:
+    """Where a generated value lives: `<state-dir>/<relDir>/<file>`.
+
+    The manifest carries each file's `relDir` -- clan's own layout,
+    `per-machine/<router>/<generator>/` or `shared/<generator>/` -- so this
+    reads the state directory the way clan would, and a translation table
+    between the two never has to exist.
+    """
+    return os.path.join(state_dir, entry["relDir"], entry["name"])
+
+
+def mint(cli: str, manifest: str, state_dir: str, prompts: dict[str, str],
+         run: Run) -> str:
+    """Run the configuration's generators, the way an operator's first deploy does.
+
+    This is the half `--secret` cannot be: the key is minted here, by the
+    generator that declares it, and only its path in the state directory reaches
+    the deploy. A check that is handed a value instead never runs the code that
+    makes one. Returns what the tool printed -- the names it minted.
+    """
+    argv = [cli, "generate", manifest, "--state-dir", state_dir]
+    for name, value in prompts.items():
+        argv += ["--prompt", f"{name}={value}"]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+    print(f"  $ nix-mikrotik generate <manifest> --state-dir {state_dir}  -> "
+          f"rc {proc.returncode}")
+    for line in (proc.stdout + proc.stderr).strip().splitlines():
+        print(f"      | {line}")
+    if proc.returncode != 0:
+        raise Failure(
+            f"the configuration's generators did not run (rc {proc.returncode}): "
+            f"{(proc.stderr or proc.stdout).strip().splitlines()[:1]}")
+    return proc.stdout
+
+
+def generated_values(gens: list[dict], state_dir: str) -> dict[str, str]:
+    """The substituted set, keyed `<generator>/<file>` -- what a deploy will use.
+
+    `deploy = false` files are intermediates another generator reads, so they are
+    not part of it; a value is read the way the tool reads it, stripped of the
+    newline a file carries.
+    """
+    values: dict[str, str] = {}
+    for gen in gens:
+        for entry in gen["files"]:
+            if not entry.get("secret", True) or not entry.get("deploy", True):
+                continue
+            path = generated_file(state_dir, gen, entry)
+            with open(path, "r", encoding="utf-8") as handle:
+                values[f"{gen['name']}/{entry['name']}"] = handle.read().strip()
+    return values
+
+
+def derive_public_key(private_key: str) -> str:
+    """The public half of a WireGuard private key, the way `wg` computes it."""
+    proc = subprocess.run(["wg", "pubkey"], input=private_key, capture_output=True,
+                          text=True, timeout=60)
+    if proc.returncode != 0:
+        raise Failure(
+            f"`wg pubkey` could not derive the public key (rc {proc.returncode}): "
+            f"{proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1")
@@ -339,6 +423,16 @@ def main() -> int:
                         metavar="NAME=VALUE",
                         help="a placeholder's value; fakes are fine, none of "
                              "these reaches a store or a repository")
+    parser.add_argument("--generators", metavar="PATH",
+                        help="the configuration's generator manifest: the check "
+                             "mints the values with `generate` and deploys with "
+                             "`--generators` instead of being handed them")
+    parser.add_argument("--generator-state-dir", metavar="DIR",
+                        help="where the minted values are kept (default: a "
+                             "directory inside this check's workdir)")
+    parser.add_argument("--prompt", action="append", default=[],
+                        metavar="NAME=VALUE",
+                        help="answer a generator prompt (repeatable)")
     parser.add_argument("--broken-script",
                         help="a script the device must refuse; without one this "
                              "check has no way to be wrong")
@@ -352,10 +446,17 @@ def main() -> int:
     for item in args.secret:
         name, value = item.split("=", 1)
         secrets[name] = value
+    prompts = {}
+    for item in args.prompt:
+        name, value = item.split("=", 1)
+        prompts[name] = value
 
     run = Run()
     workdir = tempfile.mkdtemp(prefix="chr-deploy-")
     os.chmod(workdir, 0o700)
+    state_dir = None
+    gens: list[dict] = []
+    values: dict[str, str] = {}
     try:
         rest = Rest(args.host, args.rest_port)
         print("waiting for the device's REST API")
@@ -379,10 +480,58 @@ def main() -> int:
         run.check("before the deploy no wireguard interface exists",
                   not wireguard_before, f"{len(wireguard_before)} interface(s)")
 
+        # ------------------------------------------------------------- mint --
+        # The values the configuration's menu cells reference are minted here,
+        # by the generators the configuration declares -- not handed in. This
+        # runs before the deploy and after the device is up, which is the order
+        # an operator's first deploy has.
+        if args.generators:
+            print("minting the configuration's secret values")
+            state_dir = args.generator_state_dir or os.path.join(workdir, "vars")
+            os.makedirs(state_dir, mode=0o700, exist_ok=True)
+            gens = load_manifest(args.generators)
+            run.check("the manifest declares the configuration's generators",
+                      bool(gens), ", ".join(g["name"] for g in gens) or "none")
+            printed = mint(args.cli, args.generators, state_dir, prompts, run)
+            values = generated_values(gens, state_dir)
+            run.check("`generate` reported every value it minted",
+                      bool(values) and all(
+                          f"{gen['name']}/{entry['name']}" in printed
+                          for gen in gens for entry in gen["files"]
+                          if entry.get("secret", True) and entry.get("deploy", True)),
+                      ", ".join(sorted(values)) or "none")
+            # clan's layout, because it is the layout the manifest carries:
+            # `per-machine/<router>/<generator>/<file>` (or `shared/<generator>`
+            # for a generator every machine reads), at the mode the manifest
+            # declares. A value filed anywhere else, or readable, is not a value
+            # a clan repository could hold.
+            wrong: list[str] = []
+            for gen in gens:
+                want_dir = (f"shared/{gen['name']}" if gen.get("share")
+                            else f"per-machine/{args.expect_hostname}/{gen['name']}")
+                for entry in gen["files"]:
+                    label = f"{gen['name']}/{entry['name']}"
+                    if entry["relDir"] != want_dir:
+                        wrong.append(f"{label} is under {entry['relDir']}, not {want_dir}")
+                        continue
+                    path = generated_file(state_dir, gen, entry)
+                    if not os.path.isfile(path):
+                        wrong.append(f"{label} missing")
+                        continue
+                    want = entry.get("mode") or ("0400" if entry.get("secret", True) else "0444")
+                    got = format(os.stat(path).st_mode & 0o777, "04o")
+                    if got != want:
+                        wrong.append(f"{label} is {got}, declared {want}")
+            run.check("every minted value is in clan's layout, at the mode the manifest declares",
+                      not wrong, " | ".join(wrong) or
+                      ", ".join(os.path.relpath(generated_file(state_dir, g, e), state_dir)
+                                for g in gens for e in g["files"]))
+
         # ------------------------------------------------------------ deploy --
         print("deploying the rendered configuration")
         proc = deploy(args.cli, args.script, args.host, args.ssh_port,
-                      os.path.join(workdir, "key"), args.secret, workdir)
+                      os.path.join(workdir, "key"), args.secret, workdir,
+                      generators=args.generators, state_dir=state_dir)
         output = proc.stdout + proc.stderr
         run.check("the device accepted the rendered script (rc 0)",
                   proc.returncode == 0, f"rc {proc.returncode}")
@@ -419,11 +568,15 @@ def main() -> int:
         entry = dns.get("chr-deploy.lan", {})
         run.check("the static dns entry exists, pointing where the script said",
                   entry.get("address") == "192.168.88.1", entry.get("address", "none"))
-        # A secret substituted into a comment and read back byte for byte: the
-        # value the deploy tool had to quote and escape on its way in.
+        # A value substituted into a comment and read back byte for byte: the
+        # value the deploy tool had to quote and escape on its way in. With
+        # `--generators` it is the one the prompt produced, not one this check
+        # made up.
+        delivered = dict(secrets)
+        delivered.update(values)
         run.check("a secret delivered into a comment reads back byte for byte",
-                  "dns/comment" in secrets
-                  and entry.get("comment") == secrets["dns/comment"],
+                  "dns/comment" in delivered
+                  and entry.get("comment") == delivered["dns/comment"],
                   repr(entry.get("comment", "none")))
 
         nat = rest.menu("/ip/firewall/nat")
@@ -442,6 +595,17 @@ def main() -> int:
         run.check("... with the rest of its line applied",
                   wg.get("listen-port") == "51820" and wg.get("mtu") == "1420",
                   f"listen-port={wg.get('listen-port')} mtu={wg.get('mtu')}")
+
+        # The cross-check that makes the two above mean something: the key on the
+        # device has to be the public half of the key this run minted. A deploy
+        # that substituted some other value -- a stale state directory, another
+        # router's key, a placeholder substituted from the wrong generator --
+        # would still create the interface and still set the port.
+        if args.generators and "wg/private-key" in values:
+            derived = derive_public_key(values["wg/private-key"])
+            run.check("the device's wireguard public key is the one the minted private key derives",
+                      wg.get("public-key") == derived,
+                      f"device={wg.get('public-key') or 'none'} derived={derived}")
 
         _, files = rest.get("/file")
         left = [f.get("name") for f in files
@@ -472,7 +636,8 @@ def main() -> int:
         if args.broken_script:
             print("deploying a script the device must refuse")
             proc = deploy(args.cli, args.broken_script, args.host, args.ssh_port,
-                          os.path.join(workdir, "key"), args.secret, workdir)
+                          os.path.join(workdir, "key"), args.secret, workdir,
+                          generators=args.generators, state_dir=state_dir)
             output = proc.stdout + proc.stderr
             run.check("a broken script fails the deploy instead of passing it",
                       proc.returncode != 0, f"rc {proc.returncode}")
