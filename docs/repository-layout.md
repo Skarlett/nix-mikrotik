@@ -1,0 +1,18 @@
+# Layout
+
+What lives where, and which check covers what.
+
+```
+lib/            evalMikrotik, generators, mkRouterScript, the renderer, the menu
+                table (menus.nix) and the value types (types.nix)
+modules/        base.nix (the class), menus.nix (the typed menu options),
+                hardening.nix (composable defaults)
+pkgs/           the nix-mikrotik CLI
+chr/            pinned CHR images and the two-VM lab
+examples/       module-configuration.nix and its typed twin, plus upstream's
+                untouched example
+tests/          render (two goldens), menus (typed vs sections), cli, eval,
+                chr-smoke, chr-deploy
+                (+ fixtures/: the configuration a CHR is given, and a script it
+                must refuse)
+```
