@@ -44,6 +44,11 @@ It runs inside the nixos test VM (`tests/chr-deploy.nix`) and just as well
 against a CHR from `nix run .#chr-lab -- start` on the host, which is how it was
 written and where every assertion below was first measured:
 
+`--config` points the same harness at any other configuration: it asserts only
+what holds for every script -- the device accepts it, the identity it sets, and no
+`script error:` in the device's log -- and reports the assertions about this
+fixture's own menus as skipped. That is how the examples are run against a CHR.
+
   tests/chr-deploy.py --host 127.0.0.1 --ssh-port 2201 --rest-port 8081 \\
       --script <chr-fixture>/router-config.rsc --expect-hostname chr-deploy \\
       --generators <chr-fixture-generators.json> --prompt comment=<value> \\
@@ -191,8 +196,13 @@ class Ssh:
 # ---------------------------------------------------------------------------
 
 class Run:
-    def __init__(self) -> None:
+    def __init__(self, fixture: bool = True) -> None:
         self.checks: list[tuple[str, bool, str]] = []
+        # `fixture` is the default shape: this check's own router, whose menu
+        # contents it knows. Pointed at somebody else's configuration
+        # (`--config`) only the assertions that hold for any script are made,
+        # and the rest are reported as skipped rather than quietly dropped.
+        self.fixture = fixture
 
     def check(self, description: str, ok: bool, evidence: str = "") -> bool:
         ok = bool(ok)
@@ -200,6 +210,13 @@ class Run:
         print(("  ok   " if ok else "  FAIL ") + description +
               (f"  [{evidence}]" if evidence else ""))
         return ok
+
+    def fixture_check(self, description: str, ok: bool, evidence: str = "") -> bool:
+        """An assertion about *this* fixture; skipped when running any config."""
+        if not self.fixture:
+            print("  skip " + description + "  [this check's own router, not asserted]")
+            return True
+        return self.check(description, ok, evidence)
 
     def contains(self, description: str, haystack: str, needle: str) -> bool:
         return self.check(description, needle in haystack,
@@ -436,6 +453,11 @@ def main() -> int:
     parser.add_argument("--broken-script",
                         help="a script the device must refuse; without one this "
                              "check has no way to be wrong")
+    parser.add_argument("--config", action="store_true",
+                        help="run any configuration, not this check's own: assert "
+                             "only what holds for every script (the device accepts "
+                             "it, the identity it sets, and no refused line in the "
+                             "device's log) and skip the fixture's menu contents")
     parser.add_argument("--cli", default="nix-mikrotik",
                         help="the nix-mikrotik binary to deploy with")
     parser.add_argument("--rest-wait", type=int, default=300,
@@ -451,7 +473,11 @@ def main() -> int:
         name, value = item.split("=", 1)
         prompts[name] = value
 
-    run = Run()
+    run = Run(fixture=not args.config)
+    if args.config:
+        print("--config: asserting what holds for any configuration -- the device "
+              "accepts the script, the identity it sets, and no `script error:` in "
+              "the device's log. This check's own menu contents are not asserted.")
     workdir = tempfile.mkdtemp(prefix="chr-deploy-")
     os.chmod(workdir, 0o700)
     state_dir = None
@@ -471,13 +497,13 @@ def main() -> int:
         # script and happened to be called that already.
         print("reading the device before the deploy")
         _, identity = rest.get("/system/identity")
-        run.check("before the deploy the identity is the device's own default",
+        run.fixture_check("before the deploy the identity is the device's own default",
                   identity.get("name") == "MikroTik", identity.get("name", "?"))
         bridges_before = rest.menu("/interface/bridge")
-        run.check("before the deploy no bridge exists", not bridges_before,
+        run.fixture_check("before the deploy no bridge exists", not bridges_before,
                   f"{len(bridges_before)} bridge(s)")
         wireguard_before = rest.menu("/interface/wireguard")
-        run.check("before the deploy no wireguard interface exists",
+        run.fixture_check("before the deploy no wireguard interface exists",
                   not wireguard_before, f"{len(wireguard_before)} interface(s)")
 
         # ------------------------------------------------------------- mint --
@@ -548,25 +574,25 @@ def main() -> int:
                   identity_name == args.expect_hostname, identity_name or "?")
 
         bridges = rest.menu("/interface/bridge")
-        run.check("the bridge the configuration creates exists", "lan" in bridges,
+        run.fixture_check("the bridge the configuration creates exists", "lan" in bridges,
                   ", ".join(bridges) or "none")
-        run.check("... with the comment the configuration gave it",
+        run.fixture_check("... with the comment the configuration gave it",
                   bridges.get("lan", {}).get("comment") == "chr-deploy-check",
                   repr(bridges.get("lan", {}).get("comment", "none")))
 
         _, addresses = rest.get("/ip/address")
         on_lan = [a.get("address") for a in addresses if a.get("interface") == "lan"]
-        run.check("the address the configuration puts on that bridge exists",
+        run.fixture_check("the address the configuration puts on that bridge exists",
                   "192.168.88.1/24" in on_lan, ", ".join(on_lan) or "none")
 
         dhcp = rest.menu("/ip/dhcp-server")
-        run.check("the dhcp-server that draws from the pool above it exists",
+        run.fixture_check("the dhcp-server that draws from the pool above it exists",
                   dhcp.get("lan-dhcp", {}).get("interface") == "lan",
                   ", ".join(dhcp) or "none")
 
         dns = rest.menu("/ip/dns/static")
         entry = dns.get("chr-deploy.lan", {})
-        run.check("the static dns entry exists, pointing where the script said",
+        run.fixture_check("the static dns entry exists, pointing where the script said",
                   entry.get("address") == "192.168.88.1", entry.get("address", "none"))
         # A value substituted into a comment and read back byte for byte: the
         # value the deploy tool had to quote and escape on its way in. With
@@ -574,13 +600,13 @@ def main() -> int:
         # made up.
         delivered = dict(secrets)
         delivered.update(values)
-        run.check("a secret delivered into a comment reads back byte for byte",
+        run.fixture_check("a secret delivered into a comment reads back byte for byte",
                   "dns/comment" in delivered
                   and entry.get("comment") == delivered["dns/comment"],
                   repr(entry.get("comment", "none")))
 
         nat = rest.menu("/ip/firewall/nat")
-        run.check("a comment containing '$' reads back byte for byte",
+        run.fixture_check("a comment containing '$' reads back byte for byte",
                   any(n.get("comment") == "masquerade (cost $5/GB)"
                       for n in nat.values()),
                   " | ".join(n.get("comment", "") for n in nat.values()) or "none")
@@ -590,9 +616,9 @@ def main() -> int:
         # The interface exists at all only if the *whole* script ran: the secret
         # on its line is 32 bytes of base64, and unquoted that trailing `=` ends
         # the command early and the device refuses the script from the top.
-        run.check("the interface whose line carries a secret was created",
+        run.fixture_check("the interface whose line carries a secret was created",
                   bool(wg), ", ".join(wireguard) or "none")
-        run.check("... with the rest of its line applied",
+        run.fixture_check("... with the rest of its line applied",
                   wg.get("listen-port") == "51820" and wg.get("mtu") == "1420",
                   f"listen-port={wg.get('listen-port')} mtu={wg.get('mtu')}")
 
@@ -603,7 +629,7 @@ def main() -> int:
         # would still create the interface and still set the port.
         if args.generators and "wg/private-key" in values:
             derived = derive_public_key(values["wg/private-key"])
-            run.check("the device's wireguard public key is the one the minted private key derives",
+            run.fixture_check("the device's wireguard public key is the one the minted private key derives",
                       wg.get("public-key") == derived,
                       f"device={wg.get('public-key') or 'none'} derived={derived}")
 
