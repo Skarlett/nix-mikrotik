@@ -70,6 +70,10 @@ follow from that, and both are deliberate:
   false` turns the check off for one router that has to write a menu the table
   has not been probed for.
 
+[Maintaining the menu table](maintaining-the-menu-table.md) is the other half:
+how `lists` is regenerated from a device, what the probe proves and what it only
+reports, and how to review a regeneration before it lands.
+
 ### Menus with submenus: `items`
 
 `/interface wireguard` is a list of interfaces and `/interface wireguard peers`

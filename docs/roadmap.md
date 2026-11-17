@@ -3,6 +3,12 @@
 The gaps that are deliberate, what would close each, and the two that are
 measured on a device rather than assumed.
 
+* **one RouterOS version, not two**: the menu table is walked from 7.25, while
+  `chr/default.nix` pins 7.15.3 for the lab and `checks.chr-deploy`. A menu the
+  fleet uses can therefore be in the table and absent from the device the
+  checks deploy to, or the other way round. Bumping the pin to the version the
+  table is walked from closes it; the licence and the deploy fixture need the
+  same pass ([Maintaining the menu table](maintaining-the-menu-table.md)).
 * **a real diff/reconcile**: upstream's stated goal of a structural diff needs
   a parser for `.rsc`, which does not exist here. `diff` is textual.
 * **idempotent import**: without reconciliation, `--reset` is the only

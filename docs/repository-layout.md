@@ -9,6 +9,10 @@ modules/        base.nix (the class), menus.nix (the typed menu options),
                 hardening.nix (composable defaults)
 pkgs/           the nix-mikrotik CLI
 chr/            pinned CHR images and the two-VM lab
+scripts/        the generator (walk-menus, probe-menu-lists, gen-menus,
+                regenerate-menus), menu-coverage, compare-rsc
+docs/           this page, the menu table's maintenance, and the rest of the map
+                (README.md indexes it)
 examples/       module-configuration.nix and its typed twin, plus upstream's
                 untouched example
 tests/          render (two goldens), menus (typed vs sections), cli, eval,
