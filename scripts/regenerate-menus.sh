@@ -8,6 +8,11 @@
 #
 #   scripts/regenerate-menus.sh [--skip-boot]
 #
+# `--skip-boot` walks and probes a device that is already answering on
+# `CHR_SSH_PORT` (2325 by default) instead of fetching an image and starting a
+# VM: the second run of the day, or a hand-started lab, does not need another
+# 23 MB download and another boot. Only ssh and python3 are needed then.
+#
 # Needs: qemu, ssh, curl, python3, nix (for the SRI hash check), and KVM for a
 # usable speed (falls back to TCG, which is slow but works).
 #
@@ -29,7 +34,20 @@ STATE=${CHR_STATE:-$HOME/.hermes/cache/scratch/chrgen-$VERSION}
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
-for tool in qemu-system-x86_64 ssh curl python3 unzip; do
+SKIP_BOOT=
+for arg in "$@"; do
+  case $arg in
+    --skip-boot) SKIP_BOOT=1 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -n $SKIP_BOOT ]]; then
+  tools="ssh python3"
+else
+  tools="qemu-system-x86_64 ssh curl python3 unzip"
+fi
+for tool in $tools; do
   command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 1; }
 done
 
@@ -38,7 +56,9 @@ mkdir -p "$STATE"
 # 1. The image, checked against the release's published sha256 rather than
 #    trusted. A wrong hash here means a wrong table, silently.
 img="$STATE/chr-$VERSION-$VARIANT.qcow2"
-if [[ ! -f $img ]]; then
+if [[ -n $SKIP_BOOT ]]; then
+  echo "skipping the image and the boot: expecting a device on port $PORT"
+elif [[ ! -f $img ]]; then
   url="https://github.com/elseif/MikroTikPatch/releases/download/$VERSION/chr-$VERSION-$VARIANT.qcow2.zip"
   echo "fetching $url"
   curl -sL --max-time 600 -o "$STATE/img.zip" "$url"
@@ -55,7 +75,9 @@ if [[ ! -f $img ]]; then
 fi
 
 # 2. Boot it, once. The disk keeps its licence and host keys between runs.
-if [[ ! -f $STATE/chr.pid ]] || ! kill -0 "$(cat "$STATE/chr.pid")" 2>/dev/null; then
+if [[ -n $SKIP_BOOT ]]; then
+  :
+elif [[ ! -f $STATE/chr.pid ]] || ! kill -0 "$(cat "$STATE/chr.pid")" 2>/dev/null; then
   if [[ ! -f $STATE/disk.qcow2 ]]; then cp "$img" "$STATE/disk.qcow2"; fi
   qemu-system-x86_64 \
     -name chrgen \
@@ -75,10 +97,15 @@ echo ""
 EOF
 chmod +x "$STATE/askpass.sh"
 
+# `-F /dev/null` because this device has an empty admin password and no key:
+# whatever the operator's ~/.ssh/config says (a ProxyJump, an IdentityFile, a
+# permission error on a home-managed file) is not part of this question.
+attempts=40
+[[ -n $SKIP_BOOT ]] && attempts=3
 ready=
-for _ in $(seq 1 40); do
+for _ in $(seq 1 "$attempts"); do
   if CHR_SSH_PORT=$PORT SSH_ASKPASS="$STATE/askpass.sh" SSH_ASKPASS_REQUIRE=force \
-     DISPLAY=:0 ssh -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+     DISPLAY=:0 ssh -F /dev/null -p "$PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
        -o PreferredAuthentications=password -o PubkeyAuthentication=no \
        -o LogLevel=ERROR -o ConnectTimeout=10 admin@127.0.0.1 \
        '/system resource print' 2>/dev/null | grep -q 'version:'; then
@@ -86,7 +113,13 @@ for _ in $(seq 1 40); do
   fi
   sleep 15
 done
-[[ -n $ready ]] || { echo "router never answered on port $PORT" >&2; exit 1; }
+[[ -n $ready ]] || {
+  echo "router never answered on port $PORT" >&2
+  if [[ -n $SKIP_BOOT ]]; then
+    echo "--skip-boot: nothing is listening there; start a lab device or drop the flag" >&2
+  fi
+  exit 1
+}
 
 # 4. Walk it. Retries are mandatory: a timed-out inspect and an empty child list
 #    are indistinguishable from outside, and a walk that treats the first as the

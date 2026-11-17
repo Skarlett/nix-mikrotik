@@ -37,7 +37,10 @@ ENV = dict(os.environ)
 ENV.update({"SSH_ASKPASS": ASKPASS, "SSH_ASKPASS_REQUIRE": "force", "DISPLAY": ":0"})
 
 SSH = [
-    "ssh", "-p", PORT,
+    # `-F /dev/null`: this device takes an empty password, and the operator's
+    # own ~/.ssh/config is not part of the question (a permission error on a
+    # home-managed file turns every inspect into "no children").
+    "ssh", "-F", "/dev/null", "-p", PORT,
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "PreferredAuthentications=password",
