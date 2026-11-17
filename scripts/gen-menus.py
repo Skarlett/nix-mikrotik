@@ -74,9 +74,15 @@ header = '''# GENERATED -- do not edit. Run scripts/regenerate-menus.sh instead.
 #
 # `lists` is the half of an argument the walk cannot see: the ones RouterOS
 # stores as several values (`interfaces=ether1,ether2`), which the typed menu
-# options write as a Nix list. It is probed by scripts/probe-menu-lists.py, and
-# only attributes the device *took* a comma-separated value for are listed --
-# an attribute that is absent was not proven to be scalar, it was not proven to
+# options write as a Nix list. It comes from scripts/probe-menu-lists.py, in two
+# classes, and the comment on each entry says which:
+#
+#   proven            the device *took* a comma-separated value for the argument
+#   device type only  the device reports the argument as `array`, but the menu
+#                     already had objects, and writing to a live object is not
+#                     the probe's business; a later run can promote it
+#
+# An attribute that is absent was not proven to be scalar -- it was not proven to
 # be a list. See lib/menus.overlay.nix for the ones the probe cannot reach.
 #
 # Regenerate with the CHR pinned in chr/default.nix (or the newer image the
