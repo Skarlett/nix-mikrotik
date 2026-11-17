@@ -35,9 +35,14 @@ cat result/router-config.rsc
 nix run .#nix-mikrotik -- render --name example -o router.rsc
 ```
 
-A configuration is a module — the shortest useful one declares the key its
-WireGuard interface needs as the generator that mints it, and references the
-placeholder in the menu cell:
+A configuration is a module, and every RouterOS menu is an option path: the
+menu's own path with the slashes dropped and the spaces turned into dots, so
+`/interface wireguard` is written `mikrotik.interface.wireguard`. A typo in a
+menu name or in an argument is then an evaluation error rather than a
+`script error` on the device.
+
+The shortest useful module declares the key its WireGuard interface needs as the
+generator that mints it, and references the placeholder in the menu body:
 
 ```nix
 { config, pkgs, ... }:
@@ -50,17 +55,23 @@ placeholder in the menu cell:
 
   mikrotik = {
     hostname = "router1";
-    sections = {
-      "/interface wireguard" = [
-        {
-          name = "wg0";
-          private-key = config.clan.core.vars.generators.wg-private-key.files.privkey.placeholder;
-        }
-      ];
-    };
+
+    # `/interface wireguard` has `/interface wireguard peers` under it, so the
+    # interfaces themselves are the menu's `items`.
+    interface.wireguard.items = [
+      {
+        name = "wg0";
+        private-key = config.clan.core.vars.generators.wg-private-key.files.privkey.placeholder;
+      }
+    ];
   };
 }
 ```
+
+A menu, or an argument inside one, that the table does not cover is still
+written the raw way — `mikrotik.sections."/the menu" = [ … ]`, keyed by the
+RouterOS command path. The typed options compile to exactly that, so the two
+spellings mix in one configuration and render the same script.
 
 [Quick start](docs/quick-start.md) takes that configuration through render, build
 and deploy.
