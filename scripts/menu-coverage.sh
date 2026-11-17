@@ -3,7 +3,9 @@
 #
 # The table is hand-maintained: per RouterOS menu, the attribute names a body may
 # use, and `checkMenuAttributes` turns a name that is not in it into an
-# evaluation error. That makes the table a promise, and a promise drifts -- the
+# evaluation error. `lists` -- the attributes the device stores as several values
+# -- is part of the same promise: `checkMenuLists` refuses a comma-joined string,
+# so a fleet that still writes one stops building when the pin moves. That makes the table a promise, and a promise drifts -- the
 # fleet grows a `/ip firewall filter` attribute, the table does not know it, and
 # the failure lands in the consuming repository rather than here, where the table
 # is.
@@ -73,7 +75,7 @@ import json, re, shlex, sys
 from collections import defaultdict
 
 work = sys.argv[1]
-menus = {m["path"]: (m.get("attrs"), m.get("kind")) for m in json.load(open(f"{work}/menus.json"))}
+menus = {m["path"]: (m.get("attrs"), m.get("kind"), m.get("lists") or []) for m in json.load(open(f"{work}/menus.json"))}
 
 # Menus that reach the render through `extraScript` rather than through the
 # table, and cannot be told apart from a section once rendered: chr1 sets an
@@ -86,54 +88,75 @@ EXTRA_SCRIPT = {"/interface ethernet", "/system script"}
 DELIBERATE = {"/system identity"}
 
 def parse(path):
-    """{section: attribute names}, for the `add` lines only.
+    """{section: {attribute: [values]}}, for the `add` lines only.
 
     Only `add` lines are attributed. A `set` line keys on an object name
     (`set ftp disabled=yes vrf=…`) rather than on attributes, so reading its
     `k=v` pairs as attribute names would report every value as drift.
     """
     raw = re.sub(r"\\\n\s*", "", open(path, newline="").read().replace("\r\n", "\n"))
-    section, out = None, defaultdict(set)
+    section, out = None, defaultdict(dict)
     for line in raw.split("\n"):
         s = line.strip()
         if not s or s.startswith("#"):
             continue
         if s.startswith("/"):
             section = s
-            out.setdefault(section, set())
+            out.setdefault(section, {})
             continue
         if section is None or not s.startswith("add "):
             continue
         for tok in shlex.split(s[4:]):
             if "=" in tok:
-                out[section].add(tok.split("=", 1)[0])
+                key, value = tok.split("=", 1)
+                out[section].setdefault(key, []).append(value)
             else:
-                out[section].add(tok)
+                out[section].setdefault(tok, [])
     return out
 
-used = defaultdict(set)
+used = defaultdict(lambda: defaultdict(list))
 for r in ("homelab-router", "chr1"):
     for sec, attrs in parse(f"{work}/{r}.rsc").items():
-        used[sec] |= attrs
+        for k, vs in attrs.items():
+            used[sec][k].extend(vs)
 
-missing_menus, missing_attrs = [], []
+missing_menus, missing_attrs, comma = [], [], []
 for sec in sorted(used):
     if sec in EXTRA_SCRIPT or sec in DELIBERATE:
         continue
     if sec not in menus:
         missing_menus.append(sec)
         continue
-    known, kind = menus[sec]
+    known, kind, lists = menus[sec]
     if known is None or kind != "list":   # object menus key on names, not attributes
         continue
-    unknown = sorted(used[sec] - set(known))
+    unknown = sorted(set(used[sec]) - set(known))
     if unknown:
         missing_attrs.append((sec, unknown))
+    # An argument the device stores as several values, written as one
+    # comma-joined string. The script renders the same either way, so nothing
+    # else can see it -- and this repository now refuses it at evaluation time,
+    # which means the fleet has to be migrated rather than discovered.
+    for k in lists:
+        for v in used[sec].get(k, []):
+            if "," in v:
+                comma.append((sec, k, v))
 
-if not missing_menus and not missing_attrs:
+if not missing_menus and not missing_attrs and not comma:
     covered = len([s for s in used if s not in EXTRA_SCRIPT and s not in DELIBERATE])
     print(f"menu table covers the fleet: {covered} menus, every `add` attribute known")
     sys.exit(0)
+
+if comma and not missing_menus and not missing_attrs:
+    print("the fleet still writes an argument this table now requires as a list:\n")
+    for sec, k, v in comma:
+        print(f'  {sec}: {k}="{v}"  ->  {k} = [ … ]')
+    print("\nThe typed menu refuses the comma-joined string at evaluation time, so a")
+    print("pin bump lands on a fleet that does not build until these are lists.")
+    print("A *single* value on one of these arguments cannot be told apart here --")
+    print("it renders the same as a one-element list -- and it has to become")
+    print("`k = [ \"v\" ]` as well; that part only the fleet's own evaluation shows.")
+    sys.exit(1)
 
 print("lib/menus.nix does not describe what the fleet uses.\n")
 for sec in missing_menus:
