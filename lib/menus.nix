@@ -23,6 +23,10 @@
 #   attrs  the names the body may use, checked at evaluation time; or null for
 #          "no check". The check is what turns a typo from a `script error` on a
 #          live router into a Nix evaluation error.
+#   lists  the names whose RouterOS value is several values (`interfaces=a,b`),
+#          which the typed menu writes as a Nix list. Absent means "not proven",
+#          not "scalar": it comes from scripts/probe-menu-lists.py, which only
+#          records what the device took a comma-separated value for.
 #
 # The generated list is the router's own answer rather than a guess assembled
 # from three documents, so it is wider than the hand-written table it replaces
@@ -57,6 +61,7 @@ let
         if existing == null then
           {
             inherit (o) path kind attrs;
+            lists = o.lists or [ ];
           }
         else
           existing
@@ -69,6 +74,11 @@ let
                 null
               else
                 sortStrings (existing.attrs ++ o.attrs);
+            # `lists` always unions: the overlay adds multi-value attributes the
+            # probe could not reach, and never takes one away from a menu the
+            # device answered for -- dropping one would turn a value the device
+            # stores as several into a string the typed menu accepts silently.
+            lists = sortStrings ((existing.lists or [ ]) ++ (o.lists or [ ]));
           };
     in
     acc // { ${o.path} = merged; };

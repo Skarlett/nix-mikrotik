@@ -28,6 +28,6 @@
       }
     ];
 
-    ip.dns.items.servers = "9.9.9.9";
+    ip.dns.items.servers = [ "9.9.9.9" ];
   };
 }

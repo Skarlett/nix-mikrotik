@@ -92,8 +92,10 @@
         {
           interface = "wg.luninet";
           public-key = "l0VH8y3T0nKzZ9Qq2m4Xo8b1y6wR5cJ7dE3fG9hI2kA=";
-          allowed-address = "10.44.0.0/24";
-          endpoint-address = "router.luninet";
+          # `allowed-address` is one of the arguments the router stores as
+          # several values ([ "a" "b" ]), so a single one is still a list.
+          allowed-address = [ "10.44.0.0/24" ];
+          endpoint-address = [ "router.luninet" ];
           endpoint-port = 57676;
           persistent-keepalive = "25s";
         }
@@ -102,7 +104,7 @@
       wifi.security.items = [
         {
           name = "default";
-          authentication-types = "wpa2-psk";
+          authentication-types = [ "wpa2-psk" ];
           passphrase = config.clan.core.vars.generators.wifi-password.files.passphrase.placeholder;
         }
       ];
@@ -110,8 +112,8 @@
 
     ip = {
       pool.items = [
-        { name = "wired-pool"; ranges = "10.10.10.10-10.10.10.254"; }
-        { name = "wifi-pool"; ranges = "10.10.11.10-10.10.11.254"; }
+        { name = "wired-pool"; ranges = [ "10.10.10.10-10.10.10.254" ]; }
+        { name = "wifi-pool"; ranges = [ "10.10.11.10-10.10.11.254" ]; }
       ];
 
       address = [
@@ -125,8 +127,8 @@
       ];
 
       "dhcp-server".network = [
-        { address = "10.10.10.0/24"; gateway = "10.10.10.1"; netmask = "24"; }
-        { address = "10.10.11.0/24"; gateway = "10.10.11.1"; netmask = "24"; }
+        { address = "10.10.10.0/24"; gateway = [ "10.10.10.1" ]; netmask = "24"; }
+        { address = "10.10.11.0/24"; gateway = [ "10.10.11.1" ]; netmask = "24"; }
       ];
 
       "dhcp-client".items = [ { interface = "ether1"; disabled = false; } ];
@@ -137,7 +139,9 @@
       dns.items = {
         no_label = {
           allow-remote-requests = true;
-          servers = "1.1.1.1,1.0.0.1";
+          # Written the way the device stores it: a list, not the comma-joined
+          # string `/export` prints.
+          servers = [ "1.1.1.1" "1.0.0.1" ];
         };
       };
 

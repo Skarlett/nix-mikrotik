@@ -76,7 +76,7 @@ let
         { name = "wg0"; listen-port = 51820; mtu = 1420; private-key = mkSecret "wg-key/privkey"; }
       ];
       interface.wireguard.peers = [
-        { interface = "wg0"; name = "peer1"; public-key = "abc="; allowed-address = "0.0.0.0/0"; }
+        { interface = "wg0"; name = "peer1"; public-key = "abc="; allowed-address = [ "0.0.0.0/0" ]; }
       ];
       ip.address = [
         { address = "10.0.0.3/24"; interface = "vlan10"; network = "10.0.0.0"; }
@@ -85,10 +85,10 @@ let
         { name = "dhcp1"; interface = "vlan20"; address-pool = "dhcp_pool0"; disabled = false; }
       ];
       ip."dhcp-server".network = [
-        { address = "172.29.82.0/24"; gateway = "172.29.82.1"; dns-server = "1.1.1.1,8.8.8.8"; }
+        { address = "172.29.82.0/24"; gateway = [ "172.29.82.1" ]; dns-server = [ "1.1.1.1" "8.8.8.8" ]; }
       ];
       ip.dns.items = {
-        no_label = { allow-remote-requests = true; servers = "1.1.1.1"; };
+        no_label = { allow-remote-requests = true; servers = [ "1.1.1.1" ]; };
       };
       # `/ip service` gained `/ip service webserver` in the generated table, so
       # its service names are `items` now -- the same wrapper as every other
@@ -159,6 +159,27 @@ let
     ];
   });
 
+  # A value the device stores as several values, written as one comma-joined
+  # string. It renders the same script as the list, so this layer is the only
+  # place it can be caught -- `mikrotik.sections` deliberately still takes it.
+  commaStringCaught = failsToEvaluate (render (evalMikrotik {
+    inherit pkgs;
+    modules = [ { mikrotik.ip.vrf = [ { name = "vrf.mgmt"; interfaces = "ether1,ether2"; } ]; } ];
+  }));
+
+  vrfAsList = render (evalMikrotik {
+    inherit pkgs;
+    modules = [ { mikrotik.ip.vrf = [ { name = "vrf.mgmt"; interfaces = [ "ether1" "ether2" ]; } ]; } ];
+  });
+
+  vrfCheckOff = render (evalMikrotik {
+    inherit pkgs;
+    modules = [
+      { mikrotik.checkMenuLists = false; }
+      { mikrotik.ip.vrf = [ { name = "vrf.mgmt"; interfaces = "ether1,ether2"; } ]; }
+    ];
+  });
+
   # Every menu in the table: reachable at its own attribute path, and compiled to
   # its own section key with the verb its `kind` promises.
   probes = map
@@ -200,6 +221,19 @@ let
     {
       name = "a misspelt attribute name is an evaluation error";
       ok = attributeTypoCaught;
+    }
+    {
+      name = "an argument the device stores as several values refuses a comma string";
+      ok = commaStringCaught;
+    }
+    {
+      name = "the same argument written as a list renders comma-joined";
+      ok = lib.hasInfix "\nadd interfaces=ether1,ether2" vrfAsList
+        && lib.hasInfix "name=vrf.mgmt" vrfAsList;
+    }
+    {
+      name = "mikrotik.checkMenuLists = false keeps the string form";
+      ok = lib.hasInfix "\nadd interfaces=ether1,ether2" vrfCheckOff;
     }
     {
       name = "mikrotik.checkMenuAttributes = false writes the attribute unchecked";

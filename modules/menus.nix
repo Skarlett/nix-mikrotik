@@ -50,16 +50,32 @@ let
       map (u: { label = "mikrotik"; inherit (u) path attrs names; }) (mo.unknownAttributes cfg)
     else
       [ ];
+
+  # An attribute the device stores as several values, written as one
+  # comma-joined string. It renders identically, so the only place it can be
+  # caught is here, before the script exists.
+  commaStrings =
+    if cfg.checkMenuLists then
+      map (c: { label = "mikrotik"; inherit (c) path attrs names; }) (mo.commaStrings cfg)
+    else
+      [ ];
 in
 {
   config = {
     mikrotik.sections = mo.compile cfg;
 
-    assertions = map
-      (u: {
-        assertion = u.names == [ ];
-        message = mo.messageFor u.label u;
-      })
-      unknown;
+    assertions =
+      map
+        (u: {
+          assertion = u.names == [ ];
+          message = mo.messageFor u.label u;
+        })
+        unknown
+      ++ map
+        (c: {
+          assertion = c.names == [ ];
+          message = mo.messageForCommaStrings c.label c;
+        })
+        commaStrings;
   };
 }

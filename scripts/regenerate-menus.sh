@@ -62,7 +62,7 @@ if [[ ! -f $STATE/chr.pid ]] || ! kill -0 "$(cat "$STATE/chr.pid")" 2>/dev/null;
     -machine q35,accel=kvm:tcg -cpu max -smp 2 -m 1024 \
     -drive file="$STATE/disk.qcow2",if=virtio,format=qcow2 \
     -netdev user,id=mgmt,hostfwd=tcp:127.0.0.1:"$PORT"-:22 \
-    -device virtio-net-pci,netdev=mgmt,mac:52:54:00:00:0c:25 \
+    -device virtio-net-pci,netdev=mgmt,mac=52:54:00:00:0c:25 \
     -display none -serial "file:$STATE/console.log" \
     -daemonize -pidfile "$STATE/chr.pid"
   echo "booted pid $(cat "$STATE/chr.pid"); waiting for ssh on $PORT"
@@ -92,7 +92,16 @@ done
 #    are indistinguishable from outside, and a walk that treats the first as the
 #    second returns a narrower tree that still looks complete.
 CHR_SSH_PORT=$PORT python3 "$repo/scripts/walk-menus.py" > "$STATE/tree-$VERSION.json"
-python3 "$repo/scripts/gen-menus.py" "$STATE/tree-$VERSION.json" "$repo"
+
+# 5. Ask what each argument does with a comma-separated value. The walk reports
+#    names; only the device knows which of them are several values. This step
+#    writes to the device (it creates and removes one object per menu), so it is
+#    a lab-only step -- never point it at a router that matters.
+CHR_SSH_PORT=$PORT python3 "$repo/scripts/probe-menu-lists.py" \
+  "$STATE/tree-$VERSION.json" -o "$STATE/lists-$VERSION.json"
+
+python3 "$repo/scripts/gen-menus.py" "$STATE/tree-$VERSION.json" "$repo" \
+  "$STATE/lists-$VERSION.json"
 
 echo
 echo "regenerated. Review the diff before committing:"

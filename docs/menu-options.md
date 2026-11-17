@@ -39,6 +39,37 @@ What the spelling buys:
 * the menu path is an attribute path, so it is discoverable — `nix repl`, an
   editor's completion and `nixos-option`-style inspection all work on it.
 
+### Arguments that hold several values
+
+Some arguments are one value and some are several. `/ip vrf interfaces` holds
+interfaces, `/ip pool ranges` holds ranges, `/ip firewall filter
+connection-state` holds flags — RouterOS spells all of them comma-joined in
+`/export` and stores them as separate values. In the typed menus those
+arguments take a Nix list:
+
+```nix
+mikrotik.ip.vrf = [ { name = "vrf.mgmt"; interfaces = [ "ether1" "ether2" ]; } ];
+mikrotik.ip.pool.items = [ { name = "dhcp"; ranges = [ "10.0.0.10-10.0.0.200" ]; } ];
+```
+
+A single value is still a list (`interfaces = [ "ether1" ]`), because the shape
+is a property of the argument, not of this particular router. Writing the
+comma-joined string instead is an evaluation error that names the argument and
+the list spelling.
+
+The table behind this is `lists` in `lib/menus.nix`, and it comes from the
+device: `scripts/probe-menu-lists.py` asks a CHR what each argument does with a
+comma-separated value, and records only what the device *took*. Two things
+follow from that, and both are deliberate:
+
+* **an argument absent from `lists` is not claimed to be scalar** — it was not
+  proven to be a list. Menus the probe cannot write to keep what the device
+  reports as `array` and are marked as such in the generated table;
+* **the check is an assertion, not a type** — `mikrotik.sections."/ip vrf"`
+  still takes `interfaces = "ether1,ether2"`, and `mikrotik.checkMenuLists =
+  false` turns the check off for one router that has to write a menu the table
+  has not been probed for.
+
 ### Menus with submenus: `items`
 
 `/interface wireguard` is a list of interfaces and `/interface wireguard peers`

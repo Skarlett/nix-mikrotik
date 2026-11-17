@@ -12,6 +12,13 @@
 # -- see lib/menus.overlay.nix for the menus whose keys are names rather than
 # arguments.
 #
+# `lists` is the half of an argument the walk cannot see: the ones RouterOS
+# stores as several values (`interfaces=ether1,ether2`), which the typed menu
+# options write as a Nix list. It is probed by scripts/probe-menu-lists.py, and
+# only attributes the device *took* a comma-separated value for are listed --
+# an attribute that is absent was not proven to be scalar, it was not proven to
+# be a list. See lib/menus.overlay.nix for the ones the probe cannot reach.
+#
 # Regenerate with the CHR pinned in chr/default.nix (or the newer image the
 # generator uses) and a walker that retries: a timed-out inspect and an empty
 # child list look identical from outside, so a walk without retries returns a
@@ -86,6 +93,10 @@
       "crl-use"
       "current-defaults"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "current-defaults"
+    ];
   }
   {
     path = "/cmr-client";
@@ -97,6 +108,10 @@
       "nfc-pairing"
       "pairing-requirement"
       "peer-id"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "controller-addresses"
     ];
   }
   {
@@ -1028,6 +1043,10 @@
       "one-session-per-host"
       "use-ipsec"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "authentication"
+    ];
   }
   {
     path = "/interface list";
@@ -1038,6 +1057,11 @@
       "exclude"
       "include"
       "name"
+    ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "exclude"
+      "include"
     ];
   }
   {
@@ -1136,6 +1160,10 @@
       "copy-from"
       "name"
       "server-priority"
+    ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "ciphers"
     ];
   }
   {
@@ -1268,6 +1296,13 @@
       "user-auth-method"
       "vrf"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "auth"
+      "cipher"
+      "push-routes"
+      "redirect-gateway"
+    ];
   }
   {
     path = "/interface ppp-client";
@@ -1301,6 +1336,10 @@
       "use-peer-dns"
       "user"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "allow"
+    ];
   }
   {
     path = "/interface ppp-client settings";
@@ -1327,6 +1366,10 @@
       "port"
       "profile"
       "ring-count"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "authentication"
     ];
   }
   {
@@ -1436,6 +1479,10 @@
       "max-mtu"
       "mrru"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "authentication"
+    ];
   }
   {
     path = "/interface sstp-client";
@@ -1497,6 +1544,11 @@
       "port"
       "tls-version"
       "verify-client-certificate"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "authentication"
+      "ciphers"
     ];
   }
   {
@@ -1856,6 +1908,13 @@
       "slaves-datapath"
       "slaves-static"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "caps-man-addresses"
+      "caps-man-certificate-common-names"
+      "caps-man-names"
+      "discovery-interfaces"
+    ];
   }
   {
     path = "/interface wifi capsman";
@@ -1868,6 +1927,10 @@
       "package-path"
       "require-peer-certificate"
       "upgrade-policy"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "interfaces"
     ];
   }
   {
@@ -1902,6 +1965,11 @@
       "secondary-frequency"
       "skip-dfs-channels"
       "width"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "puncture-frequencies"
+      "secondary-frequency"
     ];
   }
   {
@@ -2059,6 +2127,27 @@
       "tx-chains"
       "tx-power"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "chains"
+      "channel.puncture-frequencies"
+      "channel.secondary-frequency"
+      "debug.flags"
+      "interworking.authentication-types"
+      "interworking.connection-capabilities"
+      "interworking.domain-names"
+      "interworking.operational-classes"
+      "interworking.operator-names"
+      "interworking.realms"
+      "interworking.roaming-ois"
+      "interworking.venue-names"
+      "security.authentication-types"
+      "security.dh-groups"
+      "security.eap-methods"
+      "security.encryption"
+      "steering.neighbor-group"
+      "tx-chains"
+    ];
   }
   {
     path = "/interface wifi dashboard settings";
@@ -2099,6 +2188,11 @@
       "qr-uri"
       "supported-curves"
       "type"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "channels"
+      "supported-curves"
     ];
   }
   {
@@ -2150,6 +2244,17 @@
       "wan-symmetric"
       "wan-uplink"
       "wan-uplink-load"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "authentication-types"
+      "connection-capabilities"
+      "domain-names"
+      "operational-classes"
+      "operator-names"
+      "realms"
+      "roaming-ois"
+      "venue-names"
     ];
   }
   {
@@ -2394,6 +2499,13 @@
       "sae-pwe"
       "wps"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "authentication-types"
+      "dh-groups"
+      "eap-methods"
+      "encryption"
+    ];
   }
   {
     path = "/interface wifi security multi-passphrase";
@@ -2429,6 +2541,10 @@
       "transition-threshold-time"
       "transition-time"
       "wnm"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "neighbor-group"
     ];
   }
   {
@@ -2478,6 +2594,15 @@
       "private-key"
       "public-key"
       "responder"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "allowed-address"
+      "client-address"
+      "client-allowed-address"
+      "client-dns"
+      "client-endpoint"
+      "endpoint-address"
     ];
   }
   {
@@ -2596,6 +2721,11 @@
       "use-peer-ntp"
       "vlan-priority"
     ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "default-route-tables"
+      "dhcp-options"
+    ];
   }
   {
     path = "/ip dhcp-client option";
@@ -2660,6 +2790,11 @@
       "use-framed-as-classless"
       "use-radius"
       "use-reconfigure"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "address-lists"
+      "dynamic-lease-identifiers"
     ];
   }
   {
@@ -2752,6 +2887,14 @@
       "ntp-server"
       "wins-server"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "caps-manager"
+      "dns-server"
+      "gateway"
+      "ntp-server"
+      "wins-server"
+    ];
   }
   {
     path = "/ip dhcp-server option";
@@ -2796,6 +2939,11 @@
       "use-doh-server"
       "verify-doh-cert"
       "vrf"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "mdns-repeat-ifaces"
+      "servers"
     ];
   }
   {
@@ -3026,6 +3174,14 @@
       "tos"
       "ttl"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "connection-nat-state"
+      "connection-state"
+      "dst-address-type"
+      "hotspot"
+      "src-address-type"
+    ];
   }
   {
     path = "/ip firewall layer7-protocol";
@@ -3119,6 +3275,13 @@
       "tos"
       "ttl"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "connection-state"
+      "dst-address-type"
+      "hotspot"
+      "src-address-type"
+    ];
   }
   {
     path = "/ip firewall nat";
@@ -3191,6 +3354,12 @@
       "to-ports"
       "tos"
       "ttl"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "dst-address-type"
+      "hotspot"
+      "src-address-type"
     ];
   }
   {
@@ -3326,6 +3495,10 @@
       "trial-user-profile"
       "use-radius"
     ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "login-by"
+    ];
   }
   {
     path = "/ip hotspot service-port";
@@ -3389,6 +3562,10 @@
       "shared-users"
       "status-autorefresh"
       "transparent-proxy"
+    ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "address-list"
     ];
   }
   {
@@ -3569,6 +3746,11 @@
       "prf-algorithm"
       "proposal-check"
     ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "dh-group"
+      "enc-algorithm"
+    ];
   }
   {
     path = "/ip ipsec proposal";
@@ -3582,6 +3764,11 @@
       "lifetime"
       "name"
       "pfs-group"
+    ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "auth-algorithms"
+      "enc-algorithms"
     ];
   }
   {
@@ -3684,6 +3871,10 @@
       "mode"
       "protocol"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "protocol"
+    ];
   }
   {
     path = "/ip packing";
@@ -3705,6 +3896,10 @@
       "copy-from"
       "name"
       "next-pool"
+      "ranges"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
       "ranges"
     ];
   }
@@ -3740,6 +3935,10 @@
       "port"
       "serialize-connections"
       "src-address"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "port"
     ];
   }
   {
@@ -3910,6 +4109,10 @@
       "enabled"
       "interfaces"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "interfaces"
+    ];
   }
   {
     path = "/ip smb shares";
@@ -3923,6 +4126,11 @@
       "name"
       "read-only"
       "require-encryption"
+      "valid-users"
+    ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "invalid-users"
       "valid-users"
     ];
   }
@@ -4020,6 +4228,11 @@
       "publickey-authentication-options"
       "strong-crypto"
     ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "ciphers"
+      "known-hosts-trusted-subnets"
+    ];
   }
   {
     path = "/ip ssh known-hosts";
@@ -4069,6 +4282,10 @@
       "packet-sampling"
       "sampling-interval"
       "sampling-space"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "interfaces"
     ];
   }
   {
@@ -4157,6 +4374,10 @@
       "interfaces"
       "name"
       "place-before"
+    ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "interfaces"
     ];
   }
   {
@@ -4664,6 +4885,10 @@
       "router-advertisement-ignored-options"
       "router-advertisement-route-distance"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "router-advertisement-ignored-options"
+    ];
   }
   {
     path = "/ipv6 neighbor";
@@ -5025,6 +5250,10 @@
       "use-upnp"
       "wins-server"
     ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "address-list"
+    ];
   }
   {
     path = "/ppp secret";
@@ -5085,6 +5314,11 @@
       "total-max-limit"
       "total-priority"
       "total-queue"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "packet-marks"
+      "target"
     ];
   }
   {
@@ -5542,6 +5776,10 @@
       "select-dynamic-id"
       "select-from-vrf"
     ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "select-dynamic-id"
+    ];
   }
   {
     path = "/routing igmp-proxy";
@@ -5761,6 +5999,10 @@
       "version"
       "vrf"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "redistribute"
+    ];
   }
   {
     path = "/routing ospf interface";
@@ -5948,6 +6190,10 @@
       "update-interval"
       "vrf"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "redistribute"
+    ];
   }
   {
     path = "/routing rip interface-template";
@@ -6076,6 +6322,12 @@
       "trap-version"
       "vrf"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "trap-generators"
+      "trap-interfaces"
+      "trap-target"
+    ];
   }
   {
     path = "/snmp community";
@@ -6094,6 +6346,11 @@
       "read-access"
       "security"
       "write-access"
+    ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "addresses"
+      "denied-oids"
     ];
   }
   {
@@ -6161,6 +6418,10 @@
     attrs = [
       "uplink-interfaces"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "uplink-interfaces"
+    ];
   }
   {
     path = "/system health";
@@ -6219,6 +6480,10 @@
       "regex"
       "topics"
     ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "topics"
+    ];
   }
   {
     path = "/system logging action";
@@ -6271,6 +6536,10 @@
       "servers"
       "vrf"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "servers"
+    ];
   }
   {
     path = "/system ntp client servers";
@@ -6309,6 +6578,10 @@
       "multicast"
       "use-local-clock"
       "vrf"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "broadcast-addresses"
     ];
   }
   {
@@ -6417,6 +6690,10 @@
       "start-date"
       "start-time"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "policy"
+    ];
   }
   {
     path = "/system script";
@@ -6429,6 +6706,10 @@
       "owner"
       "policy"
       "source"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "policy"
     ];
   }
   {
@@ -6513,6 +6794,10 @@
       "authenticate"
       "enabled"
       "max-sessions"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "allowed-addresses4"
     ];
   }
   {
@@ -6655,6 +6940,10 @@
       "id"
       "secrets"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "secrets"
+    ];
   }
   {
     path = "/tool romon port";
@@ -6666,6 +6955,10 @@
       "disabled"
       "forbid"
       "interface"
+      "secrets"
+    ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
       "secrets"
     ];
   }
@@ -6682,6 +6975,10 @@
       "secret"
       "sim-pin"
       "sms-storage"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "allowed-number"
     ];
   }
   {
@@ -6719,6 +7016,24 @@
       "quick-show-frame"
       "streaming-enabled"
       "streaming-server"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "filter-cpu"
+      "filter-dst-ip-address"
+      "filter-dst-mac-address"
+      "filter-dst-port"
+      "filter-interface"
+      "filter-ip-address"
+      "filter-ip-protocol"
+      "filter-mac-address"
+      "filter-mac-protocol"
+      "filter-port"
+      "filter-size"
+      "filter-src-ip-address"
+      "filter-src-mac-address"
+      "filter-src-port"
+      "filter-vlan"
     ];
   }
   {
@@ -6781,6 +7096,39 @@
       "vlan-priority"
       "vlan-protocol"
     ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "header-stack"
+      "ip-dscp"
+      "ip-dst"
+      "ip-frag-off"
+      "ip-id"
+      "ip-protocol"
+      "ip-src"
+      "ip-ttl"
+      "ipv6-flow-label"
+      "ipv6-hop-limit"
+      "ipv6-next-header"
+      "ipv6-traffic-class"
+      "mac-dst"
+      "mac-protocol"
+      "mac-src"
+      "random-byte-offsets-and-masks"
+      "tcp-ack"
+      "tcp-data-offset"
+      "tcp-dst-port"
+      "tcp-flags"
+      "tcp-src-port"
+      "tcp-syn"
+      "tcp-urgent-pointer"
+      "tcp-window-size"
+      "udp-checksum"
+      "udp-dst-port"
+      "udp-src-port"
+      "vlan-id"
+      "vlan-priority"
+      "vlan-protocol"
+    ];
   }
   {
     path = "/tool traffic-generator port";
@@ -6812,6 +7160,12 @@
       "tcp-header-offset"
       "udp-compute-checksum"
       "udp-header-offset"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "ip-header-offset"
+      "ipv6-header-offset"
+      "random-byte-offsets-and-masks"
     ];
   }
   {
@@ -6860,6 +7214,10 @@
       "name"
       "password"
     ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "address"
+    ];
   }
   {
     path = "/user aaa";
@@ -6870,6 +7228,10 @@
       "exclude-groups"
       "interim-update"
       "use-radius"
+    ];
+    # multi-value: written as a list in the typed menu
+    lists = [
+      "exclude-groups"
     ];
   }
   {
@@ -6888,6 +7250,10 @@
       "name"
       "policy"
       "skin"
+    ];
+    # multi-value: written as a list in the typed menu (device type only)
+    lists = [
+      "policy"
     ];
   }
   {

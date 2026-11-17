@@ -18,10 +18,22 @@ import sys
 
 TREE = sys.argv[1] if len(sys.argv) > 1 else "tree-725.json"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "."
+LISTS = sys.argv[3] if len(sys.argv) > 3 else None
 
 data = json.load(open(TREE))
 tree = data["tree"]
 version, build = data["routeros"], data["build-time"]
+probe = json.load(open(LISTS)) if LISTS else {}
+# Two kinds of evidence, one field:
+#   lists  the device took a comma-separated value for this argument
+#   weak   the device reports the argument as `array` on a menu the probe could
+#          not write to (it already had objects, and writing to them is not the
+#          probe's business); recorded so a later run can revisit it
+proven = probe.get("lists", {})
+weak = probe.get("weak", {})
+lists = {}
+for path in set(proven) | set(weak):
+    lists[path] = sorted(set(proven.get(path, [])) | set(weak.get(path, [])))
 
 # Only menus that take action are menus the table can declare: a container
 # (`/interface bridge` before its `port` child, `/routing`) has neither `add`
@@ -60,6 +72,13 @@ header = '''# GENERATED -- do not edit. Run scripts/regenerate-menus.sh instead.
 # -- see lib/menus.overlay.nix for the menus whose keys are names rather than
 # arguments.
 #
+# `lists` is the half of an argument the walk cannot see: the ones RouterOS
+# stores as several values (`interfaces=ether1,ether2`), which the typed menu
+# options write as a Nix list. It is probed by scripts/probe-menu-lists.py, and
+# only attributes the device *took* a comma-separated value for are listed --
+# an attribute that is absent was not proven to be scalar, it was not proven to
+# be a list. See lib/menus.overlay.nix for the ones the probe cannot reach.
+#
 # Regenerate with the CHR pinned in chr/default.nix (or the newer image the
 # generator uses) and a walker that retries: a timed-out inspect and an empty
 # child list look identical from outside, so a walk without retries returns a
@@ -78,6 +97,16 @@ for path, kind, attrs in menus:
     body.append("    attrs = [\n")
     body.append(nix_list(sorted(set(attrs)), 6))
     body.append("    ];\n")
+    # the probe keys menus by their command path, `/ip vrf`, while the walk
+    # keys them without the leading slash
+    names = lists.get("/" + path, [])
+    if names:
+        unproven = set(names) - set(proven.get("/" + path, []))
+        body.append("    # multi-value: written as a list in the typed menu"
+                    + (" (device type only)\n" if unproven else "\n"))
+        body.append("    lists = [\n")
+        body.append(nix_list(sorted(set(names)), 6))
+        body.append("    ];\n")
     body.append("  }\n")
 
 with open("%s/lib/menus.generated.nix" % OUT, "w") as fh:

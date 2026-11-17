@@ -129,6 +129,22 @@ let
       '';
     };
 
+    checkMenuLists = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Reject an attribute the router reports as multi-value
+        (`lists` in `lib/menus.nix`) when it is written as one comma-joined
+        string instead of a Nix list.
+
+        On by default, and a separate switch from `checkMenuAttributes`: the
+        two catch different mistakes, and a configuration that has to write a
+        menu the table has not been probed for should not have to give up the
+        attribute-name check to do it. A value that is one string on purpose
+        belongs in `mikrotik.sections`, which is not checked at all.
+      '';
+    };
+
   } // menuOptions.optionTree;
 
   cfg = config.mikrotik;
