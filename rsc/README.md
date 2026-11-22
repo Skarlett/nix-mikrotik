@@ -100,6 +100,12 @@ Error: missing value(s) of argument(s) numbers`) after applying everything above
 it. Such a line is now kept verbatim as unmodelled and reported (`UNAPPLIED:`), so
 the caller can refuse instead of shipping a half-applied deploy.
 
+**A composite key built from the parts an object *carries* can be ambiguous.** An
+object missing one part — a route with no `routing-mark`, a bridge port with no
+`interface` — has a selector its neighbour also satisfies, so `remove [find …]`
+would delete both while the patch says one. Such a removal is refused
+(`UNAPPLIED: … its selector also addresses another object`) instead of emitted.
+
 ## Identity, which is the actual problem
 
 An `/export` carries no internal ids, so a patch has to name what it changes.
