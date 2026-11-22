@@ -108,6 +108,18 @@ Two other refusals come from the same principle:
   unit open forever — `ConnectTimeout` does not help once the connection is
   established.
 
+## One file per run, and what a killed deploy leaves behind
+
+The uploaded script is named `router-config-<marker>.rsc`, where the marker is the
+same random string the sentinel uses. A device has one flat file store, so a fixed
+name was shared by every deploy to it: two runs raced, and one's cleanup could
+delete the file the other's `/import` was reading — which reads as a device error.
+
+Cleanup is a `finally`, so a deploy that is SIGKILLed (or whose host dies) leaves
+the *secretized* script — plaintext secrets — on the device's flash. Nothing
+sweeps those automatically, because `router-config-*.rsc` includes a concurrent
+run's file; instead the next run lists them and says what they are.
+
 ## The transport and the refusals
 
 * Transport is the system `ssh`/`scp`: key-based auth against the router's
