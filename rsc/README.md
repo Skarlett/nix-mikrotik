@@ -73,6 +73,14 @@ file's own argument text rather than re-spelling decoded values. So:
 before tokenising, because a value that starts on the next line reads as an
 *argument name* to a naive tokeniser and the object then silently loses it.
 
+**A dangling `=` only continues when the next line is indented.** A value that
+simply ends in `=` — every base64 key ends in its padding — used to swallow the
+line after it: `add name=a copy-from=QUFB…=` followed by `add name=b` became one
+object carrying b's properties, and b was never created. That is a configuration
+line silently lost, and a patch that then "converges" without it. `/export` writes
+a continuation indented; a command never is, so the indentation is the test. Found
+by fuzzing (`tests/fuzz-rsc.py`), not by reading.
+
 ## Identity, which is the actual problem
 
 An `/export` carries no internal ids, so a patch has to name what it changes.

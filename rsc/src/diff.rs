@@ -145,6 +145,21 @@ impl Op {
         }
     }
 
+    /// The object this operation addresses, when it addresses one.
+    ///
+    /// An `Add` has no selector of its own -- it creates the object the
+    /// selector would have found -- so the caller that needs one (a withheld
+    /// replacement is reported through the `Remove` beside it) looks at that.
+    pub fn selector(&self) -> Option<&Selector> {
+        match self {
+            Op::Set { selector, .. }
+            | Op::Remove { selector, .. }
+            | Op::Move { selector, .. }
+            | Op::Unresolvable { selector, .. } => Some(selector),
+            Op::Add { .. } | Op::SingletonSet { .. } => None,
+        }
+    }
+
     /// A one-line description, used by the human report.
     pub fn describe(&self) -> String {
         match self {
@@ -416,7 +431,7 @@ fn diff_section(
     match strategy {
         Strategy::Unmodelled => {
             out.notes
-                .push("lines here are not modelled; nothing is patched".to_string());
+                .push("UNAPPLIED: lines here are not modelled; nothing is patched".to_string());
         }
         Strategy::Singleton => diff_singleton(path, a, b, opts, &mut out),
         Strategy::Keyed => diff_keyed(path, a, b, opts, &mut out),
@@ -479,21 +494,35 @@ fn withhold_removals(out: &mut SectionDiff) {
         ..stats
     };
 
-    let whole_section = out.withheld.iter().any(|op| matches!(op, Op::Add { .. }));
+    let whole_section = out.strategy == Strategy::Positional
+        && out
+            .withheld
+            .iter()
+            .any(|op| matches!(op, Op::Add { reason: AddReason::New, .. }));
+    let replaces = out
+        .withheld
+        .iter()
+        .filter(|op| matches!(op, Op::Add { reason: AddReason::Replaced, .. }))
+        .count();
+    let removes = out
+        .withheld
+        .iter()
+        .filter(|op| matches!(op, Op::Remove { .. }))
+        .count();
     out.notes.push(if whole_section {
         format!(
-            "not applied: this menu needs {} removal(s), and removals are withheld -- \
-             the device keeps its own objects here",
-            out.withheld
-                .iter()
-                .filter(|op| matches!(op, Op::Remove { .. }))
-                .count()
+            "UNAPPLIED: this menu has no stable handle, so reaching the target means \
+             rebuilding it -- {removes} removal(s) withheld, and the device keeps its own \
+             objects here"
+        )
+    } else if replaces > 0 {
+        format!(
+            "UNAPPLIED: {replaces} object(s) not re-created: a property has to disappear and \
+             RouterOS cannot unset one, so the operation is a remove plus an add -- both \
+             withheld; {removes} removal(s) withheld"
         )
     } else {
-        format!(
-            "{} removal(s) withheld: the device keeps what the target does not declare",
-            out.stats.withheld
-        )
+        format!("{removes} removal(s) withheld: the device keeps what the target does not declare")
     });
 }
 
