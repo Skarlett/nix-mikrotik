@@ -304,11 +304,23 @@ fn strategy_for(path: &str, a: Option<&Section>, b: Option<&Section>, _opts: &Op
         return Strategy::Singleton;
     }
 
-    // Only a menu the identity table calls `Ordered` has no handle at all. A
-    // keyed menu whose source addressed its objects by index (`/port set 0 …`)
-    // still has a keyed comparison available; it is the *selector* that is
-    // positional, and that is reported rather than made into a rewrite.
-    let ordered = matches!(identity_for(path), Identity::Ordered);
+    let mut objects: Vec<&Object> = Vec::new();
+    if let Some(s) = a {
+        objects.extend(s.objects.iter());
+    }
+    if let Some(s) = b {
+        objects.extend(s.objects.iter());
+    }
+
+    // A menu has no handle at all only if the table says so *and* its objects
+    // came out positional. The table's default for a menu it does not know is
+    // `Ordered`, and most of those still have a `name` — `/interface vxlan` is
+    // one — so the objects decide: if they carry a key, the menu is keyed and a
+    // diff of it is a `set`, not a rebuild. A keyed menu whose source addressed
+    // its objects by index (`/port set 0 …`) keeps its keyed comparison too; it
+    // is the *selector* that is positional, and that is reported.
+    let ordered = matches!(identity_for(path), Identity::Ordered)
+        && objects.iter().any(|o| o.selector.is_positional());
 
     if !ordered {
         // A key that appears twice in one section cannot address one object.
