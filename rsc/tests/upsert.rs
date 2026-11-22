@@ -179,6 +179,37 @@ fn emptying_a_configuration_reports_what_it_cannot_do() {
     assert!(text.contains("cannot reset"), "{}", text);
 }
 
+/// An address can sit in several lists, so removing one entry has to name the
+/// list as well as the address — keying on the address alone would take it out
+/// of every list that holds it. Found on a real 7.24.6 export, where the
+/// `ipv6` twin of a menu this table knew had fallen through to `address` alone.
+#[test]
+fn an_address_in_two_lists_is_two_objects() {
+    let opts = Options::default();
+    let a = "/ipv6 firewall address-list\nadd address=fd23:b8ed:aa54:100::/64 list=bgp-exports\nadd address=fd23:b8ed:aa54:100::/64 list=other\n";
+    let b = "/ipv6 firewall address-list\nadd address=fd23:b8ed:aa54:100::/64 list=bgp-exports\n";
+    let d = diff(&parse_config(a).unwrap(), &parse_config(b).unwrap(), &opts);
+    let s = &d.sections[0];
+    assert_eq!(
+        (s.stats.removed, s.stats.added, s.stats.replaced),
+        (1, 0, 0),
+        "{:?}",
+        s.ops
+    );
+
+    let text = render(&d, &RenderOptions::new("a.rsc", "b.rsc"));
+    assert!(
+        text.contains("remove [find address=fd23:b8ed:aa54:100::/64 list=other]"),
+        "{}",
+        text
+    );
+    assert!(
+        !text.contains("list=bgp-exports]\n"),
+        "removed the wrong entry:\n{}",
+        text
+    );
+}
+
 /// A patch is only useful if the device ends up holding exactly what the
 /// second file says. The model-level check above says the tool agrees with
 /// itself; this one pins the spelling of the operations a device will actually

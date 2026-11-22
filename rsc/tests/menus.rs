@@ -23,6 +23,7 @@
 //!   rebuilds it — the failure this table exists to catch when it grows.
 
 use rsc::diff::{diff, Options, Strategy};
+use rsc::identity::{identity_for, Identity};
 use rsc::parse_config;
 use rsc::syntax::ast::Item;
 use rsc::syntax::lexer::tokenize;
@@ -395,6 +396,39 @@ fn every_menu_with_a_name_diffs_as_a_set_not_a_rebuild() {
     }
 
     assert!(checked >= 100, "only {} name-keyed menus checked", checked);
+}
+
+/// The `ipv6` twin of a menu has to key the way its `ip` twin does. The table is
+/// written per menu, so `/ip firewall address-list` was composite while
+/// `/ipv6 firewall address-list` fell through to `address` alone — and an
+/// address can be in two lists, so a removal keyed on the address would take the
+/// entry out of both.
+#[test]
+fn every_ipv6_menu_keys_the_way_its_ip_twin_does() {
+    let mut checked = 0;
+    for menu in table() {
+        let Some(rest) = menu.path.strip_prefix("/ipv6 ") else {
+            continue;
+        };
+        let twin = format!("ip {}", rest);
+        let want = identity_for(&twin);
+        // Only menus whose ip twin has a real key; a menu with no ip twin is
+        // ordered by default and says nothing.
+        if matches!(want, Identity::Ordered) {
+            continue;
+        }
+        assert_eq!(
+            identity_for(&menu.header()),
+            want,
+            "{} keys as {:?} but its twin /{} keys as {:?}",
+            menu.path,
+            identity_for(&menu.header()),
+            twin,
+            want
+        );
+        checked += 1;
+    }
+    assert!(checked >= 4, "only {} ipv6 menus checked", checked);
 }
 
 /// The same question for the other natural key: a menu keyed by an address and

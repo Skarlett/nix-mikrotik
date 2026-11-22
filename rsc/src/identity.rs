@@ -87,6 +87,7 @@ pub fn identity_for(menu: &str) -> Identity {
         | "ip pool"
         | "ipv6 pool"
         | "ip dhcp-server"
+        | "ipv6 dhcp-server"
         | "ip dns static"
         | "ip service"
         | "ip vrf"
@@ -122,9 +123,11 @@ pub fn identity_for(menu: &str) -> Identity {
         "interface bridge port" => Identity::Composite(&["bridge", "interface"]),
         "ip address" | "ipv6 address" => Identity::Composite(&["address", "interface"]),
         "ip dhcp-server network" => Identity::Composite(&["address"]),
-        "ip dhcp-client" => Identity::Composite(&["interface"]),
+        "ip dhcp-client" | "ipv6 dhcp-client" => Identity::Composite(&["interface"]),
         "ip dhcp-server lease" => Identity::Composite(&["address", "mac-address"]),
-        "ip firewall address-list" => Identity::Composite(&["list", "address"]),
+        "ip firewall address-list" | "ipv6 firewall address-list" => {
+            Identity::Composite(&["list", "address"])
+        }
         "ip route" | "ipv6 route" => {
             Identity::Composite(&["dst-address", "gateway", "routing-mark", "vrf-interface"])
         }
