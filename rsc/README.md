@@ -115,6 +115,8 @@ src/diff.rs   strategies, operations, the report
 src/patch.rs  rendering operations as a script
 src/simulate.rs  applying a patch to a model, comparing two models
 src/bin/rsc.rs   the CLI
-tests/        round trip, the upsert property, fixtures (including a real
-              `/export` from 7.15.3 with wrapped and escaped values)
+tests/        round trip, the upsert property, the dogfood matrix over the
+              renderer's own configurations, and the generated menu table
+              (every menu path, every argument name, every multi-value
+              argument, and a `set`-not-a-rebuild diff per menu)
 ```

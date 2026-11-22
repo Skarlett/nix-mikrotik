@@ -140,10 +140,14 @@ the level at which the two files are compared: quoting is not a difference.
   decision about where the "current state" comes from (a fresh `/export`, or a
   previous generation's script).
 * **The identity table is a table, not a schema.** It covers the menus this
-  repository's renderer emits plus the obvious neighbours; a menu it does not
-  know is treated as ordered, which is safe but churny. The right long-term
-  source is `/console/inspect`, which `scripts/walk-menus.py` already uses for
-  the menu table.
+  repository's renderer emits plus the neighbours it has met; a menu it does not
+  know is keyed on whatever the object carries (`name`, then `address`), and
+  only falls back to position when there is nothing to key on. `tests/menus.rs`
+  keeps that honest: it reads `lib/menus.generated.nix` — 346 menus walked out of
+  `/console/inspect` — and requires that a one-value change in any menu with a
+  `name` (or an `address`) is a `set`, not a rebuild. `/console/inspect` is
+  still the long-term source for the *composite* keys, the same source
+  `scripts/walk-menus.py` uses.
 * **Ordered menus without comments are the weak spot.** Adding a comment to
   every rule the fleet manages is what makes a converge exact there, and that is
   a configuration convention rather than a code change.
