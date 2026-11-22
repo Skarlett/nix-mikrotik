@@ -213,13 +213,56 @@ fn update_quote(in_quote: &mut bool, s: &str) {
 /// Parse a script.
 pub fn parse(src: &str) -> Result<Document, ParseError> {
     let mut items = Vec::new();
+    // How many blocks are open. RouterOS scripts address a menu with a block —
+    // `/interface { wireguard { add … } }` — and what such a line adds depends
+    // on a loop variable, so it is not a configuration: the whole block is kept
+    // verbatim and reported as unmodelled rather than guessed at. Without this,
+    // the `{` fails to tokenise and the file is refused, which is a legitimate
+    // RouterOS script the tool simply cannot diff.
+    let mut depth: i32 = 0;
 
     for logical in logical_lines(src) {
-        let item = classify(&logical)?;
-        items.push(item);
+        let delta = brace_delta(&logical.text);
+        if depth > 0 || delta != 0 {
+            depth = (depth + delta).max(0);
+            items.push(Item::Script {
+                raw: logical.raw.clone(),
+            });
+            continue;
+        }
+        items.push(classify(&logical)?);
     }
 
     Ok(Document { items })
+}
+
+/// Net `{`/`}` count outside quotes.
+fn brace_delta(s: &str) -> i32 {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_quote {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_quote = false;
+            }
+        } else {
+            match c {
+                b'"' => in_quote = true,
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    depth
 }
 
 fn classify(logical: &Logical) -> Result<Item, ParseError> {

@@ -18,7 +18,13 @@ fn manifest(rel: &str) -> PathBuf {
 fn every_rsc() -> Vec<PathBuf> {
     let mut out = Vec::new();
     // This crate's own fixtures.
-    for name in ["a.rsc", "b.rsc", "export-7.15.3.rsc", "wrapped-string.rsc"] {
+    for name in [
+        "a.rsc",
+        "b.rsc",
+        "export-7.15.3.rsc",
+        "wrapped-string.rsc",
+        "block-script.rsc",
+    ] {
         let p = manifest(&format!("tests/fixtures/{}", name));
         if p.exists() {
             out.push(p);
@@ -164,6 +170,48 @@ fn a_script_with_a_positional_selector_parses() {
     let port = cfg.section("port").unwrap();
     assert_eq!(port.objects.len(), 1);
     assert_eq!(port.objects[0].selector.to_string(), "#0");
+}
+
+/// A script that addresses a menu with a block is still a file the tool has to
+/// read: `/interface { wireguard { add … } }` is how RouterOS lets a script
+/// choose a menu by variable. What such a line adds is not a configuration, so
+/// the block is kept verbatim — but refusing the file, which an unclosed `{` in
+/// a tokeniser does, means the tool cannot be pointed at half the fleet's
+/// scripts.
+#[test]
+fn a_script_that_addresses_menus_with_blocks_is_kept_verbatim() {
+    let src = std::fs::read_to_string(manifest("tests/fixtures/block-script.rsc")).unwrap();
+    let doc = rsc::parse(&src).expect("a block-form script must parse");
+    assert_eq!(
+        rsc::syntax::print::document(&doc),
+        src,
+        "the block script did not round trip"
+    );
+
+    // The block body is unmodelled: no `/interface` section was invented from
+    // it, and the `add name=$IFNAME` inside it is not an object.
+    let cfg = rsc::parse_config(&src).unwrap();
+    assert!(
+        cfg.section("interface").is_none(),
+        "the block form was read as a menu"
+    );
+    assert!(cfg.section("interface wireguard").is_none());
+
+    // The top-level commands after the loop are real, and are modelled.
+    let option = cfg
+        .section("ip dhcp-server option")
+        .expect("ip dhcp-server option");
+    assert_eq!(option.objects.len(), 1);
+    assert_eq!(
+        option.objects[0]
+            .props
+            .iter()
+            .find(|p| p.key == "code")
+            .unwrap()
+            .value
+            .text,
+        "121"
+    );
 }
 
 #[test]
