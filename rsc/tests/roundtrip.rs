@@ -1,0 +1,126 @@
+//! Fidelity: the parser must not lose a byte of what it was given.
+//!
+//! Two checks, because they fail differently:
+//!
+//! * the byte round trip (`parse` then print must equal the input), which
+//!   catches the parser dropping or reshuffling lines;
+//! * re-rendering each command from its tokens, which catches a lexer and a
+//!   printer that agree with each other but not with RouterOS.
+
+use rsc::syntax::ast::Item;
+use rsc::syntax::print;
+use std::path::{Path, PathBuf};
+
+fn manifest(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+fn every_rsc() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    // This crate's own fixtures.
+    for name in ["a.rsc", "b.rsc", "export-7.15.3.rsc"] {
+        let p = manifest(&format!("tests/fixtures/{}", name));
+        if p.exists() {
+            out.push(p);
+        }
+    }
+    // Everything the repository's renderer produces, which is the corpus that
+    // has to keep parsing: the golden files and the fixtures used by the
+    // deploy check.
+    for rel in [
+        "../tests/golden/legacy.rsc",
+        "../tests/golden/legacy-upstream.rsc",
+        "../tests/golden/networks.rsc",
+        "../tests/fixtures/refused.rsc",
+    ] {
+        let p = manifest(rel);
+        if p.exists() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
+fn every_script_round_trips_byte_for_byte() {
+    let files = every_rsc();
+    assert!(files.len() >= 4, "expected a corpus, found {:?}", files);
+    for path in files {
+        let src = std::fs::read_to_string(&path).unwrap();
+        let doc = rsc::parse(&src).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+        let out = print::document(&doc);
+        assert_eq!(out, src, "{} did not round trip", path.display());
+    }
+}
+
+#[test]
+fn every_command_re_renders_from_its_tokens() {
+    use rsc::syntax::lexer::tokenize;
+
+    for path in every_rsc() {
+        let src = std::fs::read_to_string(&path).unwrap();
+        let doc = rsc::parse(&src).unwrap();
+        for item in &doc.items {
+            if let Item::Command(cmd) = item {
+                // Compare token by token rather than character by character:
+                // a wrapped line joins with whitespace, and the printer drops
+                // the space after `=`, which the lexer reads the same way.
+                let source = item.raw().trim_end().replace("\\\n", " ");
+                let want: Vec<(bool, Option<String>, String)> = tokenize(&source)
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| {
+                        (
+                            t.is_pair(),
+                            t.key.clone(),
+                            t.value.map(|v| v.text).unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                let got: Vec<(bool, Option<String>, String)> = tokenize(&print::command(cmd))
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| {
+                        (
+                            t.is_pair(),
+                            t.key.clone(),
+                            t.value.map(|v| v.text).unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(got, want, "{}: command re-render differs", path.display());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_wrapped_value_is_joined_not_truncated() {
+    let src = std::fs::read_to_string(manifest("tests/fixtures/export-7.15.3.rsc")).unwrap();
+    let cfg = rsc::parse_config(&src).unwrap();
+    let dns = cfg.section("ip dns static").expect("ip dns static");
+    assert_eq!(dns.objects.len(), 1);
+    // The real export wraps `name=` onto the next line and carries escaped
+    // `"`, `\` and `$` in the comment.
+    let obj = &dns.objects[0];
+    let name = obj.props.iter().find(|p| p.key == "name").unwrap();
+    assert_eq!(name.value.text, "chr-deploy.lan");
+    let comment = obj.props.iter().find(|p| p.key == "comment").unwrap();
+    assert_eq!(comment.value.text, "chr\"deploy\\test$value");
+}
+
+#[test]
+fn a_script_with_a_positional_selector_parses() {
+    let src = "/port\nset 0 name=serial0\n";
+    let cfg = rsc::parse_config(src).unwrap();
+    let port = cfg.section("port").unwrap();
+    assert_eq!(port.objects.len(), 1);
+    assert_eq!(port.objects[0].selector.to_string(), "#0");
+}
+
+#[test]
+fn unparsable_input_is_an_error_not_a_panic() {
+    let err = rsc::parse("add comment=\"unterminated\n").unwrap_err();
+    assert_eq!(err.line, 1);
+    assert!(err.to_string().contains("unterminated quote"), "{}", err);
+}
