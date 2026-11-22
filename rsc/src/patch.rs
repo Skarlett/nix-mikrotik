@@ -58,6 +58,12 @@ pub fn render(diff: &Diff, opts: &RenderOptions) -> String {
             stats.withheld
         ));
     }
+    if stats.asserted > 0 {
+        out.push_str(&format!(
+            "# assert: {} operation(s) write a value /export cannot show, so no later diff can confirm them\n",
+            stats.asserted
+        ));
+    }
     out.push_str(&format!(
         "# exact: {}\n",
         if diff.is_exact() {

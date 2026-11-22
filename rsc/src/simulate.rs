@@ -102,6 +102,7 @@ fn apply_op(cfg: &mut Config, op: &Op) {
             section,
             selector,
             changes,
+            ..
         } => {
             let path = section.clone();
             let sec = ensure(cfg, &path);
@@ -149,7 +150,9 @@ fn apply_op(cfg: &mut Config, op: &Op) {
                 }
             }
         }
-        Op::SingletonSet { section, changes } => {
+        Op::SingletonSet {
+            section, changes, ..
+        } => {
             let path = section.clone();
             let sec = ensure(cfg, &path);
             sec.kind = SectionKind::Singleton;

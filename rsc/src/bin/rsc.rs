@@ -314,6 +314,27 @@ fn print_diff(a: &str, b: &str, d: &Diff, all: bool) {
             stats.withheld
         );
     }
+    if stats.asserted > 0 {
+        println!(
+            "  assertions: {} (the export cannot show these properties, so a diff cannot confirm them)",
+            stats.asserted
+        );
+    }
+    // The one line a drift check can branch on. A device whose only remaining
+    // writes are values `/export` cannot show is converged as far as a diff can
+    // tell, and no amount of re-running will make the plan empty.
+    if d.is_assertion_only() {
+        println!(
+            "  converged: the device holds this configuration; {} value(s) /export cannot show are re-asserted",
+            stats.asserted
+        );
+        if stats.unresolvable > 0 {
+            println!(
+                "             {} property/ies the target drops cannot be unset on RouterOS and are left in place",
+                stats.unresolvable
+            );
+        }
+    }
     println!(
         "  exact: {}",
         if d.is_exact() {
@@ -444,7 +465,7 @@ fn diff_json(a: &str, b: &str, d: &Diff) -> String {
         .collect();
     let stats = d.stats();
     format!(
-        "{{\"from\":\"{}\",\"to\":\"{}\",\"exact\":{},\"stats\":{{\"add\":{},\"set\":{},\"remove\":{},\"replace\":{},\"move\":{},\"unperformable\":{},\"withheld\":{}}},\"sections\":[{}]}}",
+        "{{\"from\":\"{}\",\"to\":\"{}\",\"exact\":{},\"stats\":{{\"add\":{},\"set\":{},\"remove\":{},\"replace\":{},\"move\":{},\"unperformable\":{},\"withheld\":{},\"asserted\":{}}},\"sections\":[{}]}}",
         json_escape(a),
         json_escape(b),
         d.is_exact(),
@@ -455,6 +476,7 @@ fn diff_json(a: &str, b: &str, d: &Diff) -> String {
         stats.moved,
         stats.unresolvable,
         stats.withheld,
+        stats.asserted,
         sections.join(",")
     )
 }
