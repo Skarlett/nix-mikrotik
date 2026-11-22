@@ -18,7 +18,7 @@ fn manifest(rel: &str) -> PathBuf {
 fn every_rsc() -> Vec<PathBuf> {
     let mut out = Vec::new();
     // This crate's own fixtures.
-    for name in ["a.rsc", "b.rsc", "export-7.15.3.rsc"] {
+    for name in ["a.rsc", "b.rsc", "export-7.15.3.rsc", "wrapped-string.rsc"] {
         let p = manifest(&format!("tests/fixtures/{}", name));
         if p.exists() {
             out.push(p);
@@ -63,10 +63,10 @@ fn every_command_re_renders_from_its_tokens() {
         for item in &doc.items {
             if let Item::Command(cmd) = item {
                 // Compare token by token rather than character by character:
-                // a wrapped line joins with whitespace, and the printer drops
-                // the space after `=`, which the lexer reads the same way.
-                let source = item.raw().trim_end().replace("\\\n", " ");
-                let want: Vec<(bool, Option<String>, String)> = tokenize(&source)
+                // a wrapped line joins with whitespace between tokens and with
+                // nothing inside a string, and the printer drops the space
+                // after `=`, all of which the lexer reads the same way.
+                let want: Vec<(bool, Option<String>, String)> = tokenize(&cmd.text)
                     .unwrap()
                     .into_iter()
                     .map(|t| {
@@ -107,6 +107,54 @@ fn a_wrapped_value_is_joined_not_truncated() {
     assert_eq!(name.value.text, "chr-deploy.lan");
     let comment = obj.props.iter().find(|p| p.key == "comment").unwrap();
     assert_eq!(comment.value.text, "chr\"deploy\\test$value");
+}
+
+/// A continuation *inside* a quoted string is not a token continuation: the
+/// backslash and the indentation RouterOS puts after it are not content. A
+/// `/system script` with a wrapped `source="…"` is the case that matters, and
+/// getting it wrong inserts a space per line into the script body, which the
+/// device then stores.
+#[test]
+fn a_continuation_inside_a_string_adds_nothing() {
+    let src = std::fs::read_to_string(manifest("tests/fixtures/wrapped-string.rsc")).unwrap();
+    let cfg = rsc::parse_config(&src).unwrap();
+    let script = cfg.section("system script").expect("system script");
+    assert_eq!(script.objects.len(), 1);
+    let source = script.objects[0]
+        .props
+        .iter()
+        .find(|p| p.key == "source")
+        .expect("source");
+
+    assert!(
+        source
+            .value
+            .text
+            .starts_with("\\n:local url \"https://example.invalid/"),
+        "the value starts with {:?}",
+        &source.value.text[..40.min(source.value.text.len())]
+    );
+    // No indentation and no injected separator before a line break.
+    assert!(
+        !source.value.text.contains(" \\n"),
+        "{:?}",
+        source.value.text
+    );
+    assert!(
+        source
+            .value
+            .text
+            .contains("\\n:local interface \"luninet-clients\""),
+        "{:?}",
+        source.value.text
+    );
+    // The wrapped `policy=` argument is still two arguments, not one value.
+    let policy = script.objects[0]
+        .props
+        .iter()
+        .find(|p| p.key == "policy")
+        .expect("policy");
+    assert_eq!(policy.value.text, "read,write,test");
 }
 
 #[test]

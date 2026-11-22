@@ -89,6 +89,10 @@ pub struct Command {
     pub extra: Vec<Tok>,
     /// The logical line as written, continuations joined.
     pub raw: String,
+    /// The command's own text, continuations joined: what the printer has to
+    /// reproduce. For a command written on a header's line (`/ip address add
+    /// …`) this starts at the verb, not at the path.
+    pub text: String,
     /// The physical line the command starts on, 1-based.
     pub line: usize,
 }

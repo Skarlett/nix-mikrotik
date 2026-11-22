@@ -102,6 +102,17 @@ fn logical_lines(src: &str) -> Vec<Logical> {
     let mut raw = String::new();
     let mut start = 1usize;
     let mut open = false;
+    // Whether the accumulated text ends inside a quoted string, and whether the
+    // next chunk continues that string. A continuation inside a string is not
+    // the same thing as one between tokens: RouterOS' own `/export` wraps a
+    // long `source="…"` by ending the line with `\` and indenting the next one,
+    // and neither the backslash nor that indentation is content. Joining it the
+    // way a token continuation is joined inserts a space into the value, which
+    // the device would then store — a multi-line script that grows a space per
+    // line on every export/import cycle.
+    let mut in_quote = false;
+    let mut sep = false;
+    let mut strip_lead = false;
 
     for (idx, phys) in src.split_inclusive('\n').enumerate() {
         let line_no = idx + 1;
@@ -111,36 +122,56 @@ fn logical_lines(src: &str) -> Vec<Logical> {
             text.clear();
             raw.clear();
             start = line_no;
+            in_quote = false;
+            sep = false;
+            strip_lead = false;
         }
         raw.push_str(phys);
 
-        let trimmed = content.trim_end();
-        let comment = trimmed.trim_start().starts_with('#');
+        let mut chunk = content;
+        if strip_lead {
+            chunk = chunk.trim_start();
+            strip_lead = false;
+        }
+
+        let trimmed = chunk.trim_end();
+        let comment = !in_quote && trimmed.trim_start().starts_with('#');
         let backslash = !comment && ends_with_unescaped_backslash(trimmed);
-        let dangling_eq = !comment && trimmed.ends_with('=') && !trimmed.ends_with("==");
+        let dangling_eq =
+            !comment && !in_quote && trimmed.ends_with('=') && !trimmed.ends_with("==");
 
         if backslash {
             let without = &trimmed[..trimmed.len() - 1];
-            if !text.is_empty() {
+            if sep && !text.is_empty() {
                 text.push(' ');
             }
-            text.push_str(without.trim_end());
+            sep = false;
+            text.push_str(without);
+            update_quote(&mut in_quote, without);
+            if in_quote {
+                // Continue the string exactly where it stopped.
+                strip_lead = true;
+            } else {
+                sep = true;
+            }
             open = true;
             continue;
         }
         if dangling_eq {
-            if !text.is_empty() {
+            if sep && !text.is_empty() {
                 text.push(' ');
             }
             text.push_str(trimmed);
+            update_quote(&mut in_quote, trimmed);
+            sep = true;
             open = true;
             continue;
         }
 
-        if !text.is_empty() {
+        if sep && !text.is_empty() {
             text.push(' ');
         }
-        text.push_str(content);
+        text.push_str(chunk);
         out.push(Logical {
             text: text.clone(),
             raw: raw.clone(),
@@ -157,6 +188,26 @@ fn logical_lines(src: &str) -> Vec<Logical> {
         });
     }
     out
+}
+
+/// Track whether a chunk leaves the scanner inside a double-quoted string.
+fn update_quote(in_quote: &mut bool, s: &str) {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if *in_quote {
+            if b[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b[i] == b'"' {
+                *in_quote = false;
+            }
+        } else if b[i] == b'"' {
+            *in_quote = true;
+        }
+        i += 1;
+    }
 }
 
 /// Parse a script.
@@ -218,7 +269,12 @@ fn classify(logical: &Logical) -> Result<Item, ParseError> {
         return match verb_idx {
             Some(i) => {
                 let path = path_of(&toks[..i]);
-                let cmd = command_from(&toks[i..], &logical.raw, logical.line);
+                // The command's own text starts at the verb. `t` is `text`
+                // trimmed at both ends, so the offset into the untrimmed line
+                // is the leading whitespace plus the token's column.
+                let lead = text.len() - t.len();
+                let cmd_text = logical.text[lead + toks[i].col..].to_string();
+                let cmd = command_from(&toks[i..], &logical.raw, cmd_text, logical.line);
                 // A command with no path (`/import file=…`) is a script line.
                 if path.is_empty() {
                     return Ok(Item::Script {
@@ -250,6 +306,7 @@ fn classify(logical: &Logical) -> Result<Item, ParseError> {
         return Ok(Item::Command(command_from(
             &toks,
             &logical.raw,
+            t.to_string(),
             logical.line,
         )));
     }
@@ -266,7 +323,7 @@ fn path_of(toks: &[Tok]) -> Vec<String> {
         .collect()
 }
 
-fn command_from(toks: &[Tok], raw: &str, line: usize) -> Command {
+fn command_from(toks: &[Tok], raw: &str, text: String, line: usize) -> Command {
     let verb = toks[0].raw.clone();
     let mut selector = None;
     let mut args = Vec::new();
@@ -299,6 +356,7 @@ fn command_from(toks: &[Tok], raw: &str, line: usize) -> Command {
         args,
         extra,
         raw: raw.to_string(),
+        text,
         line,
     }
 }
