@@ -462,17 +462,28 @@ fn diff_keyed(
                     // target's own text: that is exact by construction. The
                     // remove comes first because `add name=x` on an existing
                     // x is refused.
-                    replaces.push(Op::Remove {
-                        section: path.to_string(),
-                        selector: obj_a.selector.clone(),
-                        exact: !obj_a.selector.is_positional(),
-                    });
-                    replaces.push(Op::Add {
-                        section: path.to_string(),
-                        props: obj_b.props.clone(),
-                        place_before: None,
-                        reason: AddReason::Replaced,
-                    });
+                    replaces.push((
+                        index_of(&obj_a.selector),
+                        vec![
+                            Op::Remove {
+                                section: path.to_string(),
+                                selector: obj_a.selector.clone(),
+                                exact: !obj_a.selector.is_positional(),
+                            },
+                            Op::Add {
+                                section: path.to_string(),
+                                props: obj_b.props.clone(),
+                                place_before: if obj_a.selector.is_positional() {
+                                    // Re-created where it was, so the indices
+                                    // of the objects below it stay valid.
+                                    Some(obj_a.selector.clone())
+                                } else {
+                                    None
+                                },
+                                reason: AddReason::Replaced,
+                            },
+                        ],
+                    ));
                     out.stats.replaced += 1;
                 } else if !changed.is_empty() {
                     out.stats.changed += changed.len();
@@ -488,11 +499,14 @@ fn diff_keyed(
 
     for obj_a in &a.objects {
         if b.object(&obj_a.selector).is_none() {
-            removes.push(Op::Remove {
-                section: path.to_string(),
-                selector: obj_a.selector.clone(),
-                exact: !obj_a.selector.is_positional(),
-            });
+            removes.push((
+                index_of(&obj_a.selector),
+                vec![Op::Remove {
+                    section: path.to_string(),
+                    selector: obj_a.selector.clone(),
+                    exact: !obj_a.selector.is_positional(),
+                }],
+            ));
             out.stats.removed += 1;
         }
     }
@@ -500,8 +514,28 @@ fn diff_keyed(
     // Adds and replacements before removals: a stale object alive for one more
     // command is harmless, a missing one is not.
     out.ops.extend(adds);
-    out.ops.extend(replaces);
-    out.ops.extend(removes);
+
+    // Then the removals, positional ones first and from the end of the list:
+    // an index is only the one the source file described while nothing below it
+    // has moved, so a `remove 1` followed by `remove 2` deletes the wrong
+    // objects. Find-based removals do not care and go afterwards.
+    let mut tail: Vec<(Option<usize>, Vec<Op>)> = replaces;
+    tail.extend(removes);
+    tail.sort_by_key(|(idx, _)| match idx {
+        Some(i) => (0u8, std::cmp::Reverse(*i)),
+        None => (1u8, std::cmp::Reverse(0usize)),
+    });
+    for (_, ops) in tail {
+        out.ops.extend(ops);
+    }
+}
+
+/// The index a positional selector addresses.
+fn index_of(sel: &Selector) -> Option<usize> {
+    match sel {
+        Selector::Index(i) => Some(*i),
+        _ => None,
+    }
 }
 
 fn diff_comment_keyed(

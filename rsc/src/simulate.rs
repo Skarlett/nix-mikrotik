@@ -246,7 +246,12 @@ fn fingerprint(section: &Section, strategy: Strategy, opts: &Options) -> Vec<Str
                 .collect();
             props.sort();
             let body = props.join(" ");
-            if ordered {
+            // A positional selector is the *file's* index, not a name: two
+            // files describing the same object can number it differently (one
+            // has an extra entry above it). Comparing the index would report a
+            // difference where the configurations agree, so an object without a
+            // real key is compared by its content alone.
+            if ordered || o.selector.is_positional() {
                 body
             } else {
                 format!("{} {}", o.selector, body)
