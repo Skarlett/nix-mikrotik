@@ -9,10 +9,16 @@ measured on a device rather than assumed.
   checks deploy to, or the other way round. Bumping the pin to the version the
   table is walked from closes it; the licence and the deploy fixture need the
   same pass ([Maintaining the menu table](maintaining-the-menu-table.md)).
-* **a real diff/reconcile**: upstream's stated goal of a structural diff needs
-  a parser for `.rsc`, which does not exist here. `diff` is textual.
-* **idempotent import**: without reconciliation, `--reset` is the only
-  convergent mode, and it is destructive.
+* **a real diff/reconcile**: the parser and the differ now exist
+  ([the `.rsc` parser](rsc-parser.md)): `rsc diff` and `rsc patch` turn two
+  scripts into the console commands that take one to the other, and `rsc verify`
+  proves the patch reaches the target. What is missing is the last step — nothing
+  in the deploy path uses it yet, because that needs a decision about where the
+  "current state" comes from (a fresh `/export`, or the previous generation's
+  script). `nix-mikrotik diff` is still textual.
+* **idempotent import**: still true of `deploy`; the convergent path is the patch
+  `rsc` emits, which is not wired in yet. `--reset` remains the only convergent
+  mode the CLI itself offers, and it is destructive.
 * **`/export`-based import of existing routers**: the migration path is still
   "read the export, write the module by hand".
 * **the examples on a CHR**: they describe a router with `ether2` … `ether5` and

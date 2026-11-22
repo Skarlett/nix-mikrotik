@@ -89,6 +89,7 @@ and deploy.
 | [Deploying](docs/deploying.md) | `deploy`, `diff`, `secretize`, transport, and the refusals |
 | [Testing against a real RouterOS](docs/testing-against-a-router.md) | the CHR lab, and the checks that use it |
 | [Repository layout](docs/repository-layout.md) | what lives where, and which check covers what |
+| [The `.rsc` parser](docs/rsc-parser.md) | `rsc`: parse, diff and patch two configurations, and what a patch cannot say |
 | [Upstream differences](docs/upstream-differences.md) | what changed from Plommonsorbet's generator |
 | [Not done yet](docs/roadmap.md) | the deliberate gaps, and what would close each |
 | [Wiring into clan's service model](docs/clan-mikrotik-module.md) | the per-instance module design, and what it needs |
@@ -97,6 +98,10 @@ and deploy.
 
 The class, the CLI and the CHR checks are in use: the fleet's homelab router is
 described this way, and a rendered script is applied to a real RouterOS by
-`checks.chr-deploy` before it reaches a device. What is missing is deliberate and
-listed in [Not done yet](docs/roadmap.md) — a structural diff and reconciliation
-above all, which is why `deploy` imports rather than converges.
+`checks.chr-deploy` before it reaches a device. The structural diff now exists as
+its own tool — `rsc/` parses `.rsc`, computes the difference between two of them
+and emits the patch, verified against a CHR ([the `.rsc`
+parser](docs/rsc-parser.md)) — but `deploy` still imports rather than converges,
+because wiring the patch in needs a decision about where the current state comes
+from. The rest of what is missing is deliberate and listed in
+[Not done yet](docs/roadmap.md).
