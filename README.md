@@ -83,6 +83,7 @@ and deploy.
 | [Quick start](docs/quick-start.md) | a configuration end to end: render, build, run the tool |
 | [The module class](docs/module-class.md) | `evalMikrotik`, the options, what fails evaluation |
 | [The menu options](docs/menu-options.md) | typed menus, `items`, quoting, mixing with `sections` |
+| [The hardening campaigns](docs/hardening-campaigns.md) | how to fuzz and land a differ fix, and what is still open |
 | [Maintaining the menu table](docs/maintaining-the-menu-table.md) | regenerating it from a CHR, reading the probe, the overlay |
 | [Secrets](docs/secrets.md) | generators, placeholders, what `generate` and `deploy` do with them |
 | [Clan vars](docs/clan-vars.md) | reading a clan machine's var store, and where the parity stops |
