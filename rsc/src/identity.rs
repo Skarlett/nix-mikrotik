@@ -134,6 +134,20 @@ pub fn identity_for(menu: &str) -> Identity {
         | "ip firewall raw"
         | "ip firewall filter rule" => Identity::Ordered,
 
+        // Switch menus: a CRS-class device exports these and they have a
+        // natural key even though it is not a name.
+        "interface ethernet switch egress-vlan-tag" => Identity::Composite(&["vlan-id"]),
+        "interface ethernet switch ingress-vlan-translation" => {
+            Identity::Composite(&["ports", "customer-vid"])
+        }
+        "interface ethernet switch vlan" => Identity::Composite(&["vlan-id", "ports"]),
+        "interface ethernet switch host" => Identity::Composite(&["mac-address", "vlan-id"]),
+        "interface ethernet switch unicast-fdb" => Identity::Composite(&["mac-address", "vlan-id"]),
+        "interface ethernet switch multicast-fdb" => {
+            Identity::Composite(&["mac-address", "vlan-id"])
+        }
+        "interface ethernet switch port" => Identity::Named("name"),
+
         _ => Identity::Ordered,
     }
 }
