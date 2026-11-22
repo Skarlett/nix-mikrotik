@@ -132,7 +132,11 @@
                 (mt.mkRouterScript { inherit pkgs name; config = cfg; }))
             evaluated
           // {
-            nix-mikrotik = pkgs.callPackage ./pkgs/nix-mikrotik.nix { };
+            nix-mikrotik = pkgs.callPackage ./pkgs/nix-mikrotik.nix {
+              # The differ `deploy` drives, from this same flake: one pin, so
+              # the CLI and the crate cannot disagree about a patch.
+              rsc = config.packages.rsc;
+            };
             # The `.rsc` parser, differ and patch generator. Its own test suite
             # runs in the build, so `nix build .#rsc` is the check.
             rsc = pkgs.callPackage ./pkgs/rsc.nix { };
