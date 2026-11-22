@@ -509,6 +509,7 @@ def main() -> int:
         bridges_before = rest.menu("/interface/bridge")
         run.fixture_check("before the deploy no bridge exists", not bridges_before,
                   f"{len(bridges_before)} bridge(s)")
+        filter_before = len(rest.get("/ip/firewall/filter")[1])
         wireguard_before = rest.menu("/interface/wireguard")
         run.fixture_check("before the deploy no wireguard interface exists",
                   not wireguard_before, f"{len(wireguard_before)} interface(s)")
@@ -665,6 +666,24 @@ def main() -> int:
                   "line(s) -- RouterOS logs one for any ssh command that exits "
                   "non-zero, which the deploy's retried file removal does")
 
+        # A commented rule is what makes a menu comment-keyed, so an upsert can
+        # add to a device that already has its own rules (a factory-default CHR
+        # has four `defconf:` ones). Without the comments this menu is
+        # positional, a change means a rebuild, and a rebuild is a deletion --
+        # which is exactly what the next block shows being refused.
+        rules = rest.menu("/ip/firewall/filter", key="comment")
+        run.fixture_check("the rules the configuration declares were added, by comment",
+                          "chr-deploy: accept icmp" in rules
+                          and "chr-deploy: accept from the allowed list" in rules,
+                          ", ".join(k for k in rules if k) or "none")
+        # The count, not a guess about what the image ships: an upsert adds the
+        # two rules and removes nothing, whether the device started with no
+        # rules (the lab CHR) or with its four `defconf:` ones.
+        run.fixture_check("... and it added exactly those two rules, removing none",
+                          len(rest.get("/ip/firewall/filter")[1]) == filter_before + 2,
+                          f"{filter_before} -> "
+                          f"{len(rest.get('/ip/firewall/filter')[1])} rule(s)")
+
         # ------------------------------------------------------------ upsert --
         # `deploy` applies the difference between the device's own `/export` and
         # the script, not the script itself. What that buys is only visible on a
@@ -750,6 +769,44 @@ def main() -> int:
                   proc.returncode != 0, f"rc {proc.returncode}")
         run.contains("... and the failure says a prefix may have been applied",
                      output, PREFIX_WARNING)
+
+        # ------------------------------------------------- cannot be reached --
+        # A plan that cannot reach the target must not be applied quietly: the
+        # device would end up partly configured while the deploy reported
+        # success. One rule without a comment makes this menu positional, so a
+        # change to it means a rebuild, and a rebuild is a deletion -- withheld
+        # by default, and therefore a plan the tool has to refuse.
+        print("deploying a plan that cannot reach the target")
+        partial = os.path.join(workdir, "partial.rsc")
+        with open(args.script, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        if "/ip firewall filter" not in text:
+            raise Failure("this check's fixture has no firewall section, so the "
+                          "refusal below would test nothing")
+        with open(partial, "w", encoding="utf-8") as handle:
+            handle.write(text + "\n/ip firewall filter\nadd chain=input action=drop\n")
+        proc = deploy(args.cli, partial, args.host, args.ssh_port,
+                      os.path.join(workdir, "key"), args.secret, workdir,
+                      generators=args.generators, state_dir=state_dir)
+        output = proc.stdout + proc.stderr
+        run.check("a plan that cannot reach the target is refused", proc.returncode == 2,
+                  f"rc {proc.returncode}")
+        run.contains("... and the refusal says why, and what would allow it",
+                     output, "cannot reach this configuration")
+        run.contains("... naming the escape hatch", output, "--allow-partial")
+        before = len(rest.get("/ip/firewall/filter")[1])
+        proc = deploy(args.cli, partial, args.host, args.ssh_port,
+                      os.path.join(workdir, "key"), args.secret, workdir,
+                      generators=args.generators, state_dir=state_dir,
+                      extra=["--allow-partial"])
+        output = proc.stdout + proc.stderr
+        run.check("... and --allow-partial applies what it can", proc.returncode == 0,
+                  f"rc {proc.returncode}")
+        run.contains("... saying it is a partial configuration", output,
+                     "partial configuration")
+        run.check("... which the device did not grow a rule from",
+                  len(rest.get("/ip/firewall/filter")[1]) == before,
+                  f"{before} -> {len(rest.get('/ip/firewall/filter')[1])} rule(s)")
 
         # --------------------------------------------------------- refusals --
         if args.broken_script:

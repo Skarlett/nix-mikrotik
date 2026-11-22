@@ -93,9 +93,25 @@
         { list = "allowed_to_router"; address = "192.168.88.0/24"; }
       ];
 
+      # Every rule carries a comment, and that is what makes this menu
+      # *comment-keyed* rather than positional: a menu with no stable handle can
+      # only be reached by rebuilding it, which is a deletion, so an upsert
+      # leaves it alone. With comments the differ can add, move and set a rule
+      # on a device that already has its own (a factory-default CHR has four
+      # `defconf:` rules), which is the shape a real configuration wants.
       "/ip firewall filter" = [
-        { chain = "input"; action = "accept"; src-address-list = "allowed_to_router"; }
-        { chain = "input"; action = "accept"; protocol = "icmp"; }
+        {
+          chain = "input";
+          action = "accept";
+          src-address-list = "allowed_to_router";
+          comment = "chr-deploy: accept from the allowed list";
+        }
+        {
+          chain = "input";
+          action = "accept";
+          protocol = "icmp";
+          comment = "chr-deploy: accept icmp";
+        }
       ];
 
       "/ip firewall nat" = [

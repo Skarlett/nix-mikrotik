@@ -77,6 +77,37 @@ Both are harmless and idempotent; neither is a difference a diff against an
 export can see. A plan of "nothing to do" therefore happens when the script
 declares no secrets and no explicit defaults.
 
+## A plan that cannot reach the target is refused
+
+The differ cannot express everything. Three shapes are marked `UNAPPLIED:` in
+the plan, and `deploy` **refuses** on them by default rather than applying the
+rest and reporting success:
+
+* a target line the differ cannot model — a block script (`/interface { … }`),
+  anything a configuration put in `mikrotik.extraScript`;
+* a menu with no stable handle whose change would have to be applied by
+  *rebuilding* it, which is a deletion (see above);
+* an object whose re-creation is needed because a property has to disappear
+  (RouterOS has no unset, so that is a remove plus an add).
+
+Refusing is the point: a deploy that applies 90% of a configuration and prints
+`verified: identity is …` is worse than one that stops, because nothing on the
+device says what is missing. `--allow-partial` applies what the differ can
+express and prints what it could not; `--prune` is the answer when a deletion is
+what was missing; `--import-whole` is the answer for lines the differ cannot
+model.
+
+Two other refusals come from the same principle:
+
+* a script with **no commands** is refused. An empty render is a broken
+  configuration (a module that evaluated to nothing, a flake output that changed
+  shape), not a request to empty the device.
+* a command that **does not finish** is a failure, not a wait. Every ssh/scp
+  invocation carries a timeout (`--command-timeout`, default 120s) because a
+  wedged sshd or a script that blocks the console would otherwise hold a deploy
+  unit open forever — `ConnectTimeout` does not help once the connection is
+  established.
+
 ## The transport and the refusals
 
 * Transport is the system `ssh`/`scp`: key-based auth against the router's

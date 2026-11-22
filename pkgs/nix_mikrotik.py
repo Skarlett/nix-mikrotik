@@ -870,13 +870,20 @@ class Router:
 
     def __init__(self, host: str, user: str = "admin", port: int = 22,
                  key: str | None = None, known_hosts: str | None = None,
-                 timeout: int = 20) -> None:
+                 timeout: int = 20, command_timeout: int = 120) -> None:
         self.host = host
         self.user = user
         self.port = port
         self.key = key
         self.known_hosts = check_known_hosts(known_hosts) if known_hosts else None
         self.timeout = timeout
+        # A device that answers the TCP connection and then stops talking -- a
+        # wedged sshd, a script that blocks the console, a reboot in the middle
+        # of an import -- otherwise holds the caller open forever. A deploy that
+        # is a systemd unit has no terminal to interrupt it with, so the only
+        # way out is a timeout of our own; `ConnectTimeout` does not cover it
+        # because the connection is already established.
+        self.command_timeout = command_timeout
 
     def _common(self) -> list[str]:
         args = [
@@ -892,10 +899,19 @@ class Router:
             args += ["-o", f"UserKnownHostsFile={self.known_hosts}"]
         return args
 
-    def run(self, command: str) -> str:
+    def run(self, command: str, timeout: int | None = None) -> str:
         argv = ["ssh", *self._common(), "-p", str(self.port),
                 f"{self.user}@{self.host}", command]
-        proc = subprocess.run(argv, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=timeout or self.command_timeout)
+        except subprocess.TimeoutExpired:
+            raise ToolError(
+                f"the device did not answer within "
+                f"{timeout or self.command_timeout}s: {command}\n"
+                "the connection is open, so this is the device not finishing the "
+                "command (a script that blocks, a reboot, a wedged sshd), not a "
+                "refused connection -- check it on the console before re-running") from None
         if proc.returncode != 0:
             raise ToolError(
                 f"ssh command failed ({proc.returncode}): {command}\n"
@@ -908,7 +924,14 @@ class Router:
         # RouterOS speaks the legacy scp protocol only; current OpenSSH needs -O.
         argv = ["scp", "-O", *self._common(), "-P", str(self.port),
                 local, f"{self.user}@{self.host}:{remote}"]
-        proc = subprocess.run(argv, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=max(self.command_timeout, 300))
+        except subprocess.TimeoutExpired:
+            raise ToolError(
+                f"scp of {local} did not finish within "
+                f"{max(self.command_timeout, 300)}s -- the device's storage may be "
+                "full, or its sshd has stopped reading") from None
         if proc.returncode != 0:
             raise ToolError(f"scp failed ({proc.returncode}):\n{proc.stderr.strip()}")
         return remote
@@ -1258,6 +1281,27 @@ def patch_summary(report: str) -> str:
     return "the differ reported no operations"
 
 
+def unapplied(report: str) -> list[str]:
+    """What the plan says it cannot apply, in the differ's own words.
+
+    `rsc` marks a section it could not express with `UNAPPLIED:` rather than
+    leaving a note among the others: a deploy that reports success while part of
+    the target was never applied is the one failure an operator cannot see, so
+    the line is greppable and this tool refuses on it by default.
+
+    Three shapes reach here, all measured: a target line the differ cannot model
+    (a block script, `extraScript`), a menu with no stable handle that would have
+    to be rebuilt (which is a removal), and an object whose re-creation needs a
+    property to disappear (RouterOS has no unset).
+    """
+    marker = "UNAPPLIED:"
+    found = []
+    for line in report.splitlines():
+        if marker in line:
+            found.append(line.split(marker, 1)[1].strip())
+    return found
+
+
 def import_failed(detail: str) -> str:
     """What `deploy` says when the sentinel the script ends with was not logged.
 
@@ -1324,8 +1368,21 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             "--reset wipes the device's configuration and reboots it; "
             "pass --yes to confirm")
 
-    router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
+    router = Router(args.host, args.user, args.port, args.key, args.known_hosts,
+                    command_timeout=args.command_timeout)
     text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir, args.generators, prompt_values(args), args.dry_run)
+
+    # An empty script is not a request to empty the device. A render that
+    # produced nothing is a broken configuration -- a module that evaluated to
+    # no sections, a flake output that changed shape -- and deploying it would
+    # either do nothing (with deletions withheld, which reads as success) or, on
+    # a device this tool owns, delete everything. Refuse, and say which.
+    if not [line for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")]:
+        raise ToolError(
+            "the script contains no commands: an empty render is a broken "
+            "configuration, not a request to empty the device. Check what "
+            "produced it before deploying")
 
     if args.dry_run:
         print(f"would deploy {len(text)} bytes with {len(names)} secret(s) to "
@@ -1355,6 +1412,22 @@ def cmd_deploy(args: argparse.Namespace) -> int:
                 print(report, end="" if report.endswith("\n") else "\n")
                 print("check: nothing was sent to the device", file=sys.stderr)
                 return 1 if patch_commands(patch) else 0
+            gaps = unapplied(report)
+            if gaps and not args.allow_partial:
+                raise ToolError(
+                    "the plan cannot reach this configuration, and applying it "
+                    "anyway would report success for a device that is only "
+                    "partly configured:\n  "
+                    + "\n  ".join(gaps)
+                    + "\npass --allow-partial to apply what the differ can express "
+                      "and leave the rest as it is, or --prune where a deletion is "
+                      "what is missing, or --import-whole for lines the differ "
+                      "cannot model")
+            if gaps:
+                print("warning: applying a partial configuration; the differ cannot "
+                      "express:", file=sys.stderr)
+                for gap in gaps:
+                    print(f"  {gap}", file=sys.stderr)
             commands = patch_commands(patch)
             if not commands:
                 print("no changes: the device already holds this configuration",
@@ -1450,7 +1523,8 @@ def _normalise(text: str) -> list[str]:
 def cmd_diff(args: argparse.Namespace) -> int:
     import difflib
 
-    router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
+    router = Router(args.host, args.user, args.port, args.key, args.known_hosts,
+                    command_timeout=args.command_timeout)
     live = _normalise(router.export())
     with open(args.script, "r", encoding="utf-8") as handle:
         wanted = _normalise(handle.read())
@@ -1592,6 +1666,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print the difference and exit (1 if there is one, 0 if "
                         "the device already holds the configuration); nothing is "
                         "uploaded -- the first run against a live router")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="apply the part of the target the differ can express even "
+                        "though the rest cannot be reached (a menu with no stable "
+                        "handle, a property RouterOS cannot unset, a line it cannot "
+                        "model); without it such a plan is refused, because the "
+                        "deploy would report success for a partly-configured device")
+    p.add_argument("--command-timeout", type=int, default=120, metavar="SECONDS",
+                   help="how long one command may run before the device is called "
+                        "wedged (default: 120); an export of a large configuration "
+                        "is the command that needs more")
     p.add_argument("--wait", type=int, default=180,
                    help="seconds to wait for a reset device (default: 180)")
     p.add_argument("--verify", action="store_true",
@@ -1610,6 +1694,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--known-hosts", metavar="PATH",
                    help="known_hosts file ssh records host keys in (default: "
                         "the operator's ~/.ssh/known_hosts)")
+    p.add_argument("--command-timeout", type=int, default=120, metavar="SECONDS",
+                   help="how long one command may run before the device is called "
+                        "wedged (default: 120)")
     p.set_defaults(func=cmd_diff)
 
     return parser
