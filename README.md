@@ -13,7 +13,7 @@ is kept and everything around it is built out:
 | **module class** | configurations are modules of class `mikrotik`, with typed options, composition and assertions |
 | **build tool** | `nix build` produces the `.rsc` as a store path; `nix-mikrotik render` copies it out |
 | **secrets** | a secret is a reference that renders to a placeholder; the value is delivered at deploy time |
-| **deploy tool** | `nix-mikrotik deploy` uploads, imports, verifies and cleans up |
+| **deploy tool** | `nix-mikrotik deploy` diffs the device against the script, imports the difference, verifies and cleans up |
 | **a real RouterOS to test against** | pinned CHR images, and a two-VM lab, so a script is proven before it reaches a router |
 
 Upstream's example still renders, and `nix-build mikrotik.nix` still works. It is
@@ -98,10 +98,11 @@ and deploy.
 
 The class, the CLI and the CHR checks are in use: the fleet's homelab router is
 described this way, and a rendered script is applied to a real RouterOS by
-`checks.chr-deploy` before it reaches a device. The structural diff now exists as
-its own tool — `rsc/` parses `.rsc`, computes the difference between two of them
-and emits the patch, verified against a CHR ([the `.rsc`
-parser](docs/rsc-parser.md)) — but `deploy` still imports rather than converges,
-because wiring the patch in needs a decision about where the current state comes
-from. The rest of what is missing is deliberate and listed in
+`checks.chr-deploy` before it reaches a device. `deploy` applies the *difference*
+between the device's `/export` and the script — computed by `rsc/`, which parses
+`.rsc`, diffs two of them and emits a patch verified against a CHR ([the `.rsc`
+parser](docs/rsc-parser.md)) — so a second deploy converges instead of
+duplicating objects. Deletions are withheld unless `--prune` asks for them: the
+ownership predicate that would make them safe in general is still missing. The
+rest of what is missing is deliberate and listed in
 [Not done yet](docs/roadmap.md).

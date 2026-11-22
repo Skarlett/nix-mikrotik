@@ -1,15 +1,83 @@
 # Deploying
 
 `nix-mikrotik deploy` is the whole path from a `.rsc` to a configured device:
-substitute, upload, import, verify, clean up — and refuse when it cannot say
-the import ran.
+substitute, **diff against the device**, upload the difference, import it, verify,
+clean up — and refuse when it cannot say the import ran.
 
 ```sh
 nix-mikrotik list-secrets router.rsc      # what this script still needs
 nix-mikrotik secretize router.rsc -o out.rsc --secrets-dir ./secrets
-nix-mikrotik deploy router.rsc --host 10.0.0.1 --verify
-nix-mikrotik diff router.rsc --host 10.0.0.1
+nix-mikrotik deploy router.rsc --host 10.0.0.1 --check    # the plan, nothing sent
+nix-mikrotik deploy router.rsc --host 10.0.0.1 --verify   # apply it
+nix-mikrotik diff router.rsc --host 10.0.0.1              # a textual diff, for reading
 ```
+
+## The device is given the difference, not the script
+
+`deploy` exports the device's own configuration (`/export terse`) and asks `rsc`
+for the console commands between that and the script
+([the `.rsc` parser](rsc-parser.md)). The patch is what gets uploaded and
+imported, so a second deploy of the same script is a plan of `set`s — not a
+second copy of every object.
+
+That is the difference from re-importing: `/import` of `add` lines is not
+idempotent, so the old path could only be run once against a device that already
+held the configuration (`failure: already have interface with such name`, and the
+import stops there with everything above it applied). A patch that says
+`set [find name=…]` for an object that exists converges instead.
+
+`--import-whole` keeps the old behaviour: upload the script and import all of it.
+It is the path for a device whose `/export` the differ cannot read, and the one
+that is not idempotent.
+
+## Deletions are withheld (`--prune` applies them)
+
+By default the patch is an **upsert**: adds and sets, and every operation that
+would delete is withheld and printed as `# withheld: …` in the patch (and in
+`rsc diff`'s report). The reason is not caution for its own sake — an `/export`
+carries the device's *whole* configuration, so "not in the target" includes
+
+* the address this deploy is talking to the device over,
+* the ethernet interfaces and their settings,
+* `/ip dhcp-client` on the uplink,
+* and anything somebody added by hand.
+
+Removing those is what "the device now holds exactly the script" means, and it
+is not a decision a tool can make for you: measured on a lab CHR, the full diff
+of the test fixture against a configured device was 15 removals, one of them the
+management address the deploy was running over.
+
+`--prune` applies them. It is the mode for a device whose configuration this
+repository owns completely; the ownership predicate that would make it safe in
+general does not exist yet ([Not done yet](roadmap.md)).
+
+Two consequences of withholding, both reported rather than hidden:
+
+* a menu with **no stable handle** (`/ip firewall filter` whose rules carry no
+  comments) is compared as a list, and a rebuild is one operation — the removes
+  and the adds that replace them. Withholding half of it would append a second
+  copy of the target's rules on every deploy, so the whole menu is left alone and
+  the patch says `# note: not applied: this menu needs N removal(s)`. Give the
+  rules comments (a `comment` on every rule) and the menu becomes
+  comment-keyed: then an upsert can add and move without deleting.
+* a property that has to *disappear* from an object (`/export` never shows it,
+  and RouterOS has no unset) costs a remove-and-re-add, so it is withheld with
+  the removal it needs. `comment=""` is the one property that resets in place.
+
+## Two properties that make a deploy never completely quiet
+
+The diff is against `/export`, which is not a complete picture of the device:
+
+* a **secret** (`/interface wireguard private-key`) is never exported, so the
+  patch re-asserts it on every deploy. Same value, same object, `set` only.
+* a property the script states **explicitly at its default value**
+  (`disabled=no`) is omitted by `/export`, so the diff asks for it every time.
+
+Both are harmless and idempotent; neither is a difference a diff against an
+export can see. A plan of "nothing to do" therefore happens when the script
+declares no secrets and no explicit defaults.
+
+## The transport and the refusals
 
 * Transport is the system `ssh`/`scp`: key-based auth against the router's
   `admin` user, no library, no password handling of our own.
@@ -24,24 +92,25 @@ nix-mikrotik diff router.rsc --host 10.0.0.1
   warning, so the alternative is a deploy that looks pinned and is not. Only the
   file is selectable — `accept-new` still means accept-new, and a key pinned
   machine-wide in `/etc/ssh/ssh_known_hosts` is still read.
+* `deploy --check` prints the plan and exits — `1` when there is something to
+  apply, `0` when there is not — without uploading anything. That is the first
+  run against a live router; it reads the device and nothing else.
 * `deploy --reset` **without** `--yes` is refused before anything happens:
   before the transport, and before a secret value is read. It used to be refused
   after the secretized script had already been uploaded, which made the
   confirmation not the guard it reads as.
-* `deploy` **imports** by default, which merges into the running
-  configuration. RouterOS has no reconciliation — a repeated `add` makes a
-  second object — so importing the same script twice is not idempotent.
 * an import that did not run to the end is a failure, not a silent no-op:
   RouterOS logs a parse error and still exits 0, so `deploy` appends a sentinel
-  line to the uploaded copy and reads the device's log back before it reports
-  success. When the sentinel never appears it exits 2 and says **a prefix of the
-  script may have been applied** — the tool cannot tell a parse abort (nothing
-  applied) from a runtime one (everything above the failing line applied).
-  Check the device (`nix-mikrotik diff`) before re-deploying: a repeated `add`
-  makes a second object.
+  line to the uploaded copy — `rsc` does it for a patch, the tool does it for a
+  whole script — and reads the device's log back before it reports success. When
+  the sentinel never appears it exits 2 and says **a prefix of the script may
+  have been applied**: the tool cannot tell a parse abort (nothing applied) from
+  a runtime one (everything above the failing line applied). Check the device
+  (`deploy --check`, or `diff`) before re-deploying.
 * `deploy --reset --yes` runs `/system reset-configuration
-  no-defaults=yes run-after-reset=…` instead: the device reboots into exactly
-  the script. That is the declarative path, and it wipes the configuration.
-* `diff` exports the live configuration and diffs it textually against the
-  script. It is a review aid, not a plan: it cannot see that two differently
-  written rules mean the same thing.
+  no-defaults=yes run-after-reset=…` with the whole script instead: the device
+  reboots into exactly the script. That is the declarative path, and it wipes
+  the configuration.
+* `diff` is the *textual* comparison of the device's export and the script. It is
+  a review aid, not a plan: it cannot see that two differently written rules mean
+  the same thing, which is exactly what `deploy --check` shows.

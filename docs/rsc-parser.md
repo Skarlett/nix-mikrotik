@@ -135,10 +135,11 @@ the level at which the two files are compared: quoting is not a difference.
 
 ## What is not here
 
-* **Nothing in the deploy path uses it yet.** `nix-mikrotik deploy` still imports
-  a whole script; wiring `rsc` in front of it is the next change, and it needs a
-  decision about where the "current state" comes from (a fresh `/export`, or a
-  previous generation's script).
+* **Deletions are opt-in.** `rsc patch --upsert` (and `rsc diff --upsert`) emits
+  adds and sets only, and reports every operation it withheld; that is the mode
+  `nix-mikrotik deploy` uses, because an `/export` carries the whole
+  configuration and "not in the target" is not "not wanted"
+  ([Deploying](deploying.md)). `deploy --prune` asks for the full diff.
 * **The identity table is a table, not a schema.** It covers the menus this
   repository's renderer emits plus the neighbours it has met; a menu it does not
   know is keyed on whatever the object carries (`name`, then `address`), and
