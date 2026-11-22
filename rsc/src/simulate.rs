@@ -89,11 +89,22 @@ fn apply_op(cfg: &mut Config, op: &Op) {
                 line: 0,
                 origin: Origin::Add,
             };
-            match place_before.as_ref().and_then(|anchor| {
-                sec.objects
+            // `place-before` is an *index* in a positional section: the patch
+            // says `place-before=0`, which is a position in the list as it
+            // stands, not a key to look up. Matching it by selector key (the old
+            // behaviour) found nothing -- the objects carry names even when the
+            // section is compared positionally -- so every such add appended
+            // instead of inserting, and a patch that works on a device did not
+            // reach the target in the model.
+            let pos = match place_before {
+                Some(Selector::Index(i)) => Some((*i).min(sec.objects.len())),
+                Some(anchor) => sec
+                    .objects
                     .iter()
-                    .position(|o| o.selector.key() == anchor.key())
-            }) {
+                    .position(|o| o.selector.key() == anchor.key()),
+                None => None,
+            };
+            match pos {
                 Some(pos) => sec.objects.insert(pos, obj),
                 None => sec.objects.push(obj),
             }
@@ -398,6 +409,19 @@ mod tests {
         round_trip(
             "/ip firewall filter\nadd chain=input action=accept comment=a\nadd chain=input action=drop comment=b\n",
             "/ip firewall filter\nadd chain=input action=drop comment=b\nadd chain=input action=accept comment=a\nadd chain=input action=accept comment=c\n",
+        );
+    }
+
+    /// A positional section of the same length is patched by index, and
+    /// `place-before=<index>` has to insert at that position. Found by fuzzing:
+    /// two objects swapped in `/console alias` produced a patch that was right
+    /// for a device and did not round-trip in the model, because the anchor was
+    /// matched as a key (`#0`) against objects that carry names.
+    #[test]
+    fn a_positional_replace_inserts_where_place_before_says() {
+        round_trip(
+            "/console alias\nadd key=wan copy-from=!flag\nadd key=wg0 scope=10.0.0.1/24 path=value\n",
+            "/console alias\nadd key=ghost scope=value users=10.0.0.1/24\nadd key=wan copy-from=!flag\n",
         );
     }
 
