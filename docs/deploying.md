@@ -123,9 +123,15 @@ Two other refusals come from the same principle:
   warning, so the alternative is a deploy that looks pinned and is not. Only the
   file is selectable — `accept-new` still means accept-new, and a key pinned
   machine-wide in `/etc/ssh/ssh_known_hosts` is still read.
-* `deploy --check` prints the plan and exits — `1` when there is something to
-  apply, `0` when there is not — without uploading anything. That is the first
-  run against a live router; it reads the device and nothing else.
+* `deploy --check` prints the plan and exits — `1` when the device differs, `0`
+  when it is converged — without uploading anything. That is the first run
+  against a live router, and it is the drift gate a wrapper script can branch on.
+  "Converged" means every operation left is an **assertion**: a write of a
+  property `/export` cannot show (a WireGuard `private-key`, a property stated at
+  its default), which no later diff can confirm. The report says so on its own
+  line (`converged: … N value(s) /export cannot show are re-asserted`), because
+  counting operations would make a correct device fail forever. A plan that
+  cannot reach the target is `1` whatever it contains.
 * `deploy --reset` **without** `--yes` is refused before anything happens:
   before the transport, and before a secret value is read. It used to be refused
   after the secretized script had already been uploaded, which made the

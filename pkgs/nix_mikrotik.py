@@ -1281,6 +1281,19 @@ def patch_summary(report: str) -> str:
     return "the differ reported no operations"
 
 
+def converged(report: str) -> bool:
+    """Did the differ find nothing the device can report would change?
+
+    `rsc diff` says `converged:` when every operation left is a write of a value
+    `/export` cannot show -- a WireGuard private key, a property stated at its
+    default. That is the honest answer to "is this device in the declared
+    state": the diff can never be empty for such a script, because the export it
+    compares against never carries those values, so counting operations would
+    make a drift check fail forever on a device that is correct.
+    """
+    return any(line.strip().startswith("converged:") for line in report.splitlines())
+
+
 def unapplied(report: str) -> list[str]:
     """What the plan says it cannot apply, in the differ's own words.
 
@@ -1411,7 +1424,20 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             if args.check:
                 print(report, end="" if report.endswith("\n") else "\n")
                 print("check: nothing was sent to the device", file=sys.stderr)
-                return 1 if patch_commands(patch) else 0
+                gaps = unapplied(report)
+                if gaps:
+                    # A plan that cannot reach the target is not a converged
+                    # device, however few commands it emits.
+                    print("check: the plan cannot reach this configuration:",
+                          file=sys.stderr)
+                    for gap in gaps:
+                        print(f"  {gap}", file=sys.stderr)
+                    return 1
+                if converged(report):
+                    print("check: converged", file=sys.stderr)
+                    return 0
+                print("check: the device differs", file=sys.stderr)
+                return 1
             gaps = unapplied(report)
             if gaps and not args.allow_partial:
                 raise ToolError(
@@ -1440,6 +1466,10 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             body = patch
             summary = patch_summary(report)
             print(f"{summary}", file=sys.stderr)
+            if converged(report):
+                print("the device already holds this configuration; the plan "
+                      "re-asserts only values /export cannot show",
+                      file=sys.stderr)
             if not args.prune:
                 print("removals are withheld (upsert): pass --prune to apply "
                       "the operations that delete", file=sys.stderr)
