@@ -761,7 +761,7 @@ fn diff_positional(
         });
         out.stats.added += 1;
     }
-    if !a.objects.is_empty() || !b.objects.is_empty() {
+    if !a.objects.is_empty() {
         out.notes.push(
             "no stable handle in this menu, so the section is rebuilt: exact, but every object \
              is re-created"
