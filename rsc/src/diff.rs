@@ -33,12 +33,32 @@ pub struct Options {
     /// which omits them is not seen as wanting them removed. `/ip address`
     /// carries `network=`, which the device computes from `address=`.
     pub ignore_derived: bool,
+    /// Whether the plan may delete objects.
+    ///
+    /// `Apply` is the diff: it says what turns `a` into `b`, deletions
+    /// included. `Withhold` is the *upsert*: adds and sets only, for a deploy
+    /// that has no ownership predicate and must not remove what it did not
+    /// create — an `/export` carries the device's whole configuration, so
+    /// "not in the target" is not the same as "not wanted" (the management
+    /// address, the ethernet interfaces, a rule somebody added by hand).
+    pub removals: Removals,
+}
+
+/// Whether a diff may emit deletions. See [`Options::removals`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Removals {
+    /// Deletions are part of the plan.
+    #[default]
+    Apply,
+    /// The plan is upserts only; deletions are reported but not emitted.
+    Withhold,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             ignore_derived: true,
+            removals: Removals::Apply,
         }
     }
 }
@@ -175,6 +195,10 @@ pub struct Stats {
     pub replaced: usize,
     pub moved: usize,
     pub unresolvable: usize,
+    /// Operations the plan computed and did not emit, because they delete
+    /// (`Options::removals`). Counted separately: they are not part of the
+    /// patch, and a reader has to be told they exist.
+    pub withheld: usize,
 }
 
 impl Stats {
@@ -191,6 +215,9 @@ pub struct SectionDiff {
     pub ops: Vec<Op>,
     pub stats: Stats,
     pub notes: Vec<String>,
+    /// Operations this section computed and did not emit, in the order they
+    /// would have run. See [`Options::removals`].
+    pub withheld: Vec<Op>,
 }
 
 /// The whole diff.
@@ -214,8 +241,20 @@ impl Diff {
             total.replaced += s.stats.replaced;
             total.moved += s.stats.moved;
             total.unresolvable += s.stats.unresolvable;
+            total.withheld += s.stats.withheld;
         }
         total
+    }
+
+    /// Every operation that was computed and withheld, with its section.
+    ///
+    /// `Options::removals = Withhold` leaves these out of the patch, so the
+    /// caller that asked for an upsert still has to be told what the device
+    /// will keep that the target does not declare.
+    pub fn withheld(&self) -> impl Iterator<Item = (&str, &Op)> {
+        self.sections
+            .iter()
+            .flat_map(|s| s.withheld.iter().map(move |op| (s.path.as_str(), op)))
     }
 
     /// Whether every operation the diff emitted is one the device can perform
@@ -371,6 +410,7 @@ fn diff_section(
         ops: Vec::new(),
         stats: Stats::default(),
         notes: Vec::new(),
+        withheld: Vec::new(),
     };
 
     match strategy {
@@ -384,7 +424,77 @@ fn diff_section(
         Strategy::Positional => diff_positional(path, a, b, opts, &mut out),
     }
 
+    if opts.removals == Removals::Withhold {
+        withhold_removals(&mut out);
+    }
+
     out
+}
+
+/// Take the destructive half out of a section's plan.
+///
+/// An upsert may not delete, and what that costs is more than the `remove`
+/// lines:
+///
+/// * a **replacement** is a remove plus an add, so keeping half of it adds a
+///   second object beside the one it meant to replace;
+/// * a **positional section**'s adds are only correct once its removes have run
+///   (the rebuild is one operation: the same length in the target's order), so
+///   a rebuild the patch may not perform is left alone whole — otherwise every
+///   deploy appends another copy of the target's rules;
+/// * a **move** restores an order computed against a list the removes would
+///   have shortened, so it is withheld with them.
+///
+/// Everything else — adds of new objects, sets, singleton sets — is kept, which
+/// is what makes the result an upsert rather than a no-op.
+fn withhold_removals(out: &mut SectionDiff) {
+    if !out.ops.iter().any(|op| matches!(op, Op::Remove { .. })) {
+        return;
+    }
+    let rebuild = out.strategy == Strategy::Positional;
+    let mut kept = Vec::with_capacity(out.ops.len());
+    for op in std::mem::take(&mut out.ops) {
+        let drop = match &op {
+            Op::Remove { .. } | Op::Move { .. } => true,
+            Op::Add {
+                reason: AddReason::Replaced,
+                ..
+            } => true,
+            Op::Add { .. } if rebuild => true,
+            _ => false,
+        };
+        if drop {
+            out.withheld.push(op);
+        } else {
+            kept.push(op);
+        }
+    }
+    out.ops = kept;
+    // Recounted from what is left rather than decremented: a replacement's
+    // remove is counted as `replaced`, not as `removed`, so per-kind arithmetic
+    // on the way out would have to know which remove it was looking at.
+    let stats = stats_of(&out.ops);
+    out.stats = Stats {
+        withheld: out.withheld.len(),
+        ..stats
+    };
+
+    let whole_section = out.withheld.iter().any(|op| matches!(op, Op::Add { .. }));
+    out.notes.push(if whole_section {
+        format!(
+            "not applied: this menu needs {} removal(s), and removals are withheld -- \
+             the device keeps its own objects here",
+            out.withheld
+                .iter()
+                .filter(|op| matches!(op, Op::Remove { .. }))
+                .count()
+        )
+    } else {
+        format!(
+            "{} removal(s) withheld: the device keeps what the target does not declare",
+            out.stats.withheld
+        )
+    });
 }
 
 fn empty_section(path: &str) -> Section {
@@ -540,6 +650,34 @@ fn diff_keyed(
     for (_, ops) in tail {
         out.ops.extend(ops);
     }
+}
+
+/// Recount a section's operations by kind.
+///
+/// The incremental counters in the strategies answer "how much changed" while
+/// they build the plan; this answers the same question for a plan that has been
+/// filtered, and the two have to agree, so the rules are spelled once here.
+fn stats_of(ops: &[Op]) -> Stats {
+    let mut stats = Stats::default();
+    for op in ops {
+        match op {
+            Op::Add {
+                reason: AddReason::New,
+                ..
+            } => stats.added += 1,
+            Op::Add {
+                reason: AddReason::Replaced,
+                ..
+            } => stats.replaced += 1,
+            Op::Set { changes, .. } | Op::SingletonSet { changes, .. } => {
+                stats.changed += changes.len()
+            }
+            Op::Remove { .. } => stats.removed += 1,
+            Op::Move { .. } => stats.moved += 1,
+            Op::Unresolvable { .. } => stats.unresolvable += 1,
+        }
+    }
+    stats
 }
 
 /// The index a positional selector addresses.

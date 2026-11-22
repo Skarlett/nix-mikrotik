@@ -231,3 +231,154 @@ fn the_patch_spells_operations_the_way_a_console_does() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// upsert mode: adds and sets only, for a deploy that does not own the device
+// ---------------------------------------------------------------------------
+
+fn upsert() -> Options {
+    Options {
+        removals: rsc::Removals::Withhold,
+        ..Options::default()
+    }
+}
+
+fn upsert_between(a: &str, b: &str) -> (String, rsc::Diff, Vec<String>) {
+    let opts = upsert();
+    let ca = parse_config(a).unwrap();
+    let cb = parse_config(b).unwrap();
+    let d = diff(&ca, &cb, &opts);
+    let text = render(&d, &RenderOptions::new("a.rsc", "b.rsc"));
+    let applied = simulate::apply(&ca, &d);
+    let problems = simulate::compare(&cb, &applied, &d, &opts);
+    (text, d, problems)
+}
+
+/// The whole point: a device's `/export` carries objects the target script never
+/// mentions (the management address, the ethernet interfaces, a rule somebody
+/// added by hand). An upsert must reach the target's objects and leave those
+/// alone, and say what it left alone.
+#[test]
+fn an_upsert_adds_and_sets_and_deletes_nothing() {
+    let a = "/ip pool\nadd name=lan ranges=10.0.0.10-10.0.0.20\nadd name=stale ranges=10.9.0.10-10.9.0.20\n\
+             /ip dns\nset servers=1.1.1.1\n";
+    let b = "/ip pool\nadd name=lan ranges=10.0.0.10-10.0.0.30\nadd name=wan ranges=10.1.0.10-10.1.0.20\n\
+             /ip dns\nset servers=9.9.9.9\n";
+    let (text, d, problems) = upsert_between(a, b);
+
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert_eq!(d.stats().removed, 0, "{:?}", d.stats());
+    let commands: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim_start())
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('/'))
+        .collect();
+    assert!(
+        commands.iter().all(|l| !l.starts_with("remove ")),
+        "a removal reached the patch:\n{}",
+        text
+    );
+    assert!(text.contains("set [find name=lan] ranges=10.0.0.10-10.0.0.30"), "{}", text);
+    assert!(text.contains("add name=wan ranges=10.1.0.10-10.1.0.20"), "{}", text);
+    assert!(text.contains("set servers=9.9.9.9"), "{}", text);
+    // And the deletion is reported rather than silently dropped.
+    assert!(text.contains("# withheld: remove name=stale"), "{}", text);
+    assert!(text.contains("1 removal(s) withheld"), "{}", text);
+}
+
+/// A menu with no stable handle is rebuilt as one operation. Keeping half of it
+/// -- the adds, dropping the removes -- would append a second copy of the
+/// target's rules on every deploy, so an upsert leaves the whole menu alone.
+#[test]
+fn an_upsert_leaves_a_rebuild_it_cannot_finish_alone() {
+    let a = "/ip firewall filter\nadd chain=input action=accept protocol=icmp\n\
+             add chain=input action=drop\n";
+    let b = "/ip firewall filter\nadd chain=input action=accept protocol=icmp\n";
+    let (text, d, problems) = upsert_between(a, b);
+    let filter = d.sections.iter().find(|s| s.path == "ip firewall filter").unwrap();
+
+    assert_eq!(filter.strategy, rsc::Strategy::Positional);
+    assert!(filter.ops.is_empty(), "half a rebuild reached the patch: {:?}", filter.ops);
+    // Two removes and the one add that only makes sense after them.
+    assert_eq!(filter.withheld.len(), 3, "{:?}", filter.withheld);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert!(!text.contains("\nadd chain"), "an add from a rebuild reached the patch:\n{}", text);
+    assert!(text.contains("# note: not applied"), "{}", text);
+}
+
+/// A replacement is a remove plus an add: keeping the add alone would duplicate
+/// the object it meant to replace, so both halves are withheld.
+#[test]
+fn an_upsert_does_not_half_apply_a_replacement() {
+    // `comment` is the one property that resets in place (comment=""), so the
+    // property that has to disappear here is one RouterOS cannot unset.
+    let a = "/ip dhcp-server\nadd name=lan-dhcp address-pool=lan interface=lan\n";
+    let b = "/ip dhcp-server\nadd name=lan-dhcp interface=lan\n";
+    let (text, d, problems) = upsert_between(a, b);
+    let pool = d
+        .sections
+        .iter()
+        .find(|s| s.path == "ip dhcp-server")
+        .unwrap();
+    assert!(pool.ops.is_empty(), "{:?}", pool.ops);
+    assert_eq!(pool.stats.withheld, 2, "{:?}", pool.withheld);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert!(!text.contains("add name=lan-dhcp"), "{}", text);
+}
+
+/// The other direction of the same property: what the target declares is what
+/// the device ends up holding, checked over the corpus the differ is dogfooded
+/// on. Every ordered pair, because a fleet export and a rendered script differ
+/// in both directions.
+#[test]
+fn an_upsert_reaches_the_targets_objects_for_every_fixture_pair() {
+    let files = [
+        ("a", fixture("a.rsc")),
+        ("b", fixture("b.rsc")),
+        ("export", fixture("export-7.15.3.rsc")),
+        ("chr", fixture("rendered/chr-fixture.rsc")),
+        ("example", fixture("rendered/example.rsc")),
+    ];
+    for (an, a) in &files {
+        for (bn, b) in &files {
+            if an == bn {
+                continue;
+            }
+            let (text, d, problems) = upsert_between(a, b);
+            // A menu the patch may not rebuild keeps whatever the device holds,
+            // so a target object that lives there is legitimately absent. The
+            // diff reports that as withheld, and a miss is tolerated only in a
+            // section that says so -- the rule the dogfood matrix uses.
+            let skipped: Vec<String> = d
+                .sections
+                .iter()
+                .filter(|s| s.withheld.iter().any(|op| matches!(op, Op::Add { .. })))
+                .map(|s| format!("/{}:", s.path))
+                .collect();
+            let unexpected: Vec<&String> = problems
+                .iter()
+                .filter(|p| !skipped.iter().any(|s| p.starts_with(s)))
+                .collect();
+            assert!(
+                unexpected.is_empty(),
+                "upsert {} -> {} did not reach the target:\n{}\n--- patch ---\n{}",
+                an,
+                bn,
+                unexpected
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                text
+            );
+            assert_eq!(
+                d.stats().removed,
+                0,
+                "upsert {} -> {} emitted a removal:\n{}",
+                an,
+                bn,
+                text
+            );
+        }
+    }
+}

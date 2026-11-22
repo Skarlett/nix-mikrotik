@@ -9,7 +9,7 @@
 //! What it cannot prove is that RouterOS behaves the way the model says. That
 //! is a separate claim, checked against a CHR; see `README.md`.
 
-use crate::diff::{Diff, Op, Options, Strategy};
+use crate::diff::{Diff, Op, Options, Removals, Strategy};
 use crate::identity;
 use crate::model::{Object, Origin, Prop, Section, SectionKind, Selector};
 use crate::Config;
@@ -171,7 +171,17 @@ fn apply_op(cfg: &mut Config, op: &Op) {
 ///
 /// Order matters only where the menu has no stable identity: an ordered section
 /// is compared as a list, a keyed one as a map.
+///
+/// In upsert mode (`Options::removals = Withhold`) the claim being checked is
+/// deliberately different, not weaker: the patch deletes nothing, so the result
+/// has to *hold every object the target declares, with every property it
+/// declares* — see [`compare_upsert`]. An object the device keeps that the
+/// target does not mention, or a property the patch could not drop, is what
+/// "upsert" means, and is reported by the diff as withheld rather than here.
 pub fn compare(expected: &Config, actual: &Config, diff: &Diff, opts: &Options) -> Vec<String> {
+    if opts.removals == Removals::Withhold {
+        return compare_upsert(expected, actual, opts);
+    }
     let mut out = Vec::new();
 
     for section in &expected.sections {
@@ -226,6 +236,51 @@ pub fn compare(expected: &Config, actual: &Config, diff: &Diff, opts: &Options) 
         }
     }
 
+    out
+}
+
+/// The upsert claim: every object the target declares is on the device, with
+/// every property the target gives it.
+///
+/// Objects are matched by *content*, not by index: the patch may not delete, so
+/// the device's list can be longer than the target's and an index would name a
+/// different object on the two sides. Extra objects, extra properties and the
+/// order of a list are not failures here — they are the objects the patch was
+/// told to leave alone, and the diff reports them as withheld.
+fn compare_upsert(expected: &Config, actual: &Config, opts: &Options) -> Vec<String> {
+    let mut out = Vec::new();
+    for section in &expected.sections {
+        let Some(got) = actual.section(&section.path) else {
+            out.push(format!("/{}: missing entirely", section.path));
+            continue;
+        };
+        for want in &section.objects {
+            let props: Vec<&Prop> = want
+                .props
+                .iter()
+                .filter(|p| !(opts.ignore_derived && is_derived(&section.path, &p.key)))
+                // An empty value and an absent property are the same state:
+                // `/export` omits both.
+                .filter(|p| !p.value.text.is_empty())
+                .collect();
+            let found = got.objects.iter().any(|have| {
+                props.iter().all(|p| {
+                    crate::model::prop_text(&have.props, &p.key) == Some(p.value.text.as_str())
+                })
+            });
+            if !found {
+                let body = props
+                    .iter()
+                    .map(|p| format!("{}={}", p.key, p.value.text))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push(format!(
+                    "/{}: expected {} {}",
+                    section.path, want.selector, body
+                ));
+            }
+        }
+    }
     out
 }
 

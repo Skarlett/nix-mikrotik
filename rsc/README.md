@@ -8,11 +8,33 @@ compute the difference and apply only that.
 
 ```
 rsc parse  <file>              what the parser found
-rsc fmt    <file> [--check]    re-print the file; --check fails if it differs
+rsc fmt    <file> [--check]    re-print; --check fails if it differs
 rsc diff   <a.rsc> <b.rsc>     the operations that turn a into b
 rsc patch  <a.rsc> <b.rsc>     those operations as a .rsc script
 rsc verify <a.rsc> <b.rsc>     apply the patch to a in the model and compare
 ```
+
+`--upsert` changes what the plan may contain: adds and sets only, with every
+operation that would delete withheld and reported (`# withheld: …` in the patch,
+`withheld:` lines in `rsc diff`). That is the mode `nix-mikrotik deploy` uses —
+an `/export` carries the device's whole configuration, so an object the target
+does not mention is not necessarily one to delete. `rsc verify --upsert` checks
+the claim that mode makes: every object the target declares is reached, with
+every property it declares.
+
+```
+$ rsc patch live.rsc wanted.rsc --upsert --sentinel deploy-1
+# ops:  0 add, 5 set, 0 remove, 0 replace, 0 move, 1 unperformable
+# withheld: 17 operation(s) would delete; this patch is an upsert and leaves them out
+/ip address
+# note: 3 removal(s) withheld: the device keeps what the target does not declare
+set [find address=10.0.0.1/24 interface=ether1] comment="managed"
+# withheld: remove address=192.168.99.2/24 interface=ether1
+```
+
+A menu with no stable handle is rebuilt as one operation (its removes and its
+adds), so an upsert withholds the whole menu rather than appending a second copy
+of its rules; its note says so.
 
 No dependencies, no build script: `cargo test` builds the parser, the differ and
 the simulator from std alone.

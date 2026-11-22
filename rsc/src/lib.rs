@@ -25,7 +25,7 @@ pub mod patch;
 pub mod simulate;
 pub mod syntax;
 
-pub use diff::{Diff, Options, Strategy};
+pub use diff::{Diff, Options, Removals, Strategy};
 pub use model::{Config, Object, Prop, Section, SectionKind, Selector};
 pub use syntax::ast::Document;
 

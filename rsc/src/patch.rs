@@ -52,6 +52,12 @@ pub fn render(diff: &Diff, opts: &RenderOptions) -> String {
         "# ops:  {} add, {} set, {} remove, {} replace, {} move, {} unperformable\n",
         stats.added, stats.changed, stats.removed, stats.replaced, stats.moved, stats.unresolvable
     ));
+    if stats.withheld > 0 {
+        out.push_str(&format!(
+            "# withheld: {} operation(s) would delete; this patch is an upsert and leaves them out\n",
+            stats.withheld
+        ));
+    }
     out.push_str(&format!(
         "# exact: {}\n",
         if diff.is_exact() {
@@ -63,7 +69,7 @@ pub fn render(diff: &Diff, opts: &RenderOptions) -> String {
 
     let mut wrote_section = String::new();
     for section in &diff.sections {
-        if section.ops.is_empty() {
+        if section.ops.is_empty() && section.withheld.is_empty() {
             continue;
         }
         if wrote_section != section.path {
@@ -78,6 +84,12 @@ pub fn render(diff: &Diff, opts: &RenderOptions) -> String {
                 out.push_str(&line);
                 out.push('\n');
             }
+        }
+        // What the patch deliberately does not do, spelled as the command it
+        // would have been, so a reader can run one by hand if that is what they
+        // meant. A comment, because `/import` would otherwise perform it.
+        for op in &section.withheld {
+            out.push_str(&format!("# withheld: {}\n", op.describe()));
         }
     }
 
