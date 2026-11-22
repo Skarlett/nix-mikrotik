@@ -318,7 +318,28 @@ fn apply_command(section: &mut Section, cmd: &Command) {
                 }
             }
             None => {
-                // A `set` with no selector is the menu's single settings object.
+                // A `set` with no selector is the menu's single settings object --
+                // but only in a menu that *has* one. `/ip pool` is a list of
+                // pools, so `set comment=x` inside it names nothing, and modelling
+                // it as the section's singleton produced an object the differ then
+                // tried to delete with an empty selector: a bare `remove`, which
+                // RouterOS refuses at import time after applying everything above
+                // it (measured on 7.15.3: `Script Error: missing value(s) of
+                // argument(s) numbers`).
+                //
+                // RouterOS' own `/export` never writes that line in a list menu
+                // (it writes `set [find …]` or `set <n>`), so it is not a shape
+                // worth guessing at: the line is kept verbatim as unmodelled, the
+                // section stays a list, and the differ reports that it cannot be
+                // applied rather than inventing a target for it.
+                let named = section
+                    .objects
+                    .iter()
+                    .any(|o| o.selector != Selector::Singleton);
+                if named {
+                    section.extras.push(cmd.raw.trim_end().to_string());
+                    return;
+                }
                 section.kind = SectionKind::Singleton;
                 let props = props_of(cmd);
                 match section.object_mut(&Selector::Singleton) {
@@ -369,6 +390,22 @@ mod tests {
         assert_eq!(s.objects.len(), 2);
         assert_eq!(s.objects[0].selector, Selector::Named("lan".into()));
         assert_eq!(s.objects[1].selector, Selector::Named("wan".into()));
+    }
+
+    /// A `set` with no selector names the menu's single settings object -- but
+    /// only in a menu that has one. In a list menu it names nothing, and
+    /// guessing (the old behaviour) produced an object the differ then tried to
+    /// delete with an empty selector: a bare `remove`, which RouterOS refuses
+    /// mid-import.
+    #[test]
+    fn a_selectorless_set_in_a_list_menu_is_unmodelled() {
+        let cfg = parse_config("/ip pool\nadd name=a ranges=1\nset comment=x\n");
+        let pool = cfg.section("ip pool").unwrap();
+        assert_eq!(pool.kind, SectionKind::Objects);
+        assert_eq!(pool.objects.len(), 1, "{:?}", pool.objects);
+        assert_eq!(pool.extras.len(), 1, "{:?}", pool.extras);
+        assert!(pool.extras[0].starts_with("set comment=x"), "{:?}", pool.extras);
+        assert!(pool.object(&Selector::Singleton).is_none());
     }
 
     #[test]
