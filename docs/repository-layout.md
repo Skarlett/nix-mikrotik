@@ -8,6 +8,8 @@ lib/            evalMikrotik, generators, mkRouterScript, the renderer, the menu
 modules/        base.nix (the class), menus.nix (the typed menu options),
                 hardening.nix (composable defaults)
 pkgs/           the nix-mikrotik CLI
+rsc/            the `.rsc` parser, differ and patch generator (Rust, no
+                dependencies; `cargo test` or `nix build .#rsc`)
 chr/            pinned CHR images and the two-VM lab
 scripts/        the generator (walk-menus, probe-menu-lists, gen-menus,
                 regenerate-menus), menu-coverage, compare-rsc

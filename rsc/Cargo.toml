@@ -1,0 +1,21 @@
+[package]
+name = "rsc"
+version = "0.1.0"
+edition = "2021"
+description = "Parse, diff and upsert MikroTik RouterOS .rsc configuration scripts"
+license = "MIT"
+publish = false
+
+# Deliberately dependency-free: the parser, the differ and the patch emitter are
+# all std-only, so `cargo test` is hermetic and the crate builds in the same
+# sandbox as the rest of this repository. The `nix-mikrotik-rs/` prototype next
+# to this directory pins `ssh2`, an unrelated concern; keeping it out of this
+# build graph is why this is a separate crate rather than a workspace member.
+[dependencies]
+
+[[bin]]
+name = "rsc"
+path = "src/bin/rsc.rs"
+
+[profile.release]
+lto = true

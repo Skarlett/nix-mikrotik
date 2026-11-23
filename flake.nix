@@ -133,6 +133,9 @@
             evaluated
           // {
             nix-mikrotik = pkgs.callPackage ./pkgs/nix-mikrotik.nix { };
+            # The `.rsc` parser, differ and patch generator. Its own test suite
+            # runs in the build, so `nix build .#rsc` is the check.
+            rsc = pkgs.callPackage ./pkgs/rsc.nix { };
             chr-lab = chr.lab;
             mikrotik-chr = chr.image;
             mikrotik-option = chr.optionPackage;
@@ -187,6 +190,11 @@
               type = "app";
               program = lib.getExe config.packages.nix-mikrotik;
               meta.description = "Build, secret-deliver and deploy RouterOS scripts";
+            };
+            rsc = {
+              type = "app";
+              program = lib.getExe config.packages.rsc;
+              meta.description = "Parse, diff and patch RouterOS .rsc scripts";
             };
             default = config.apps.chr-lab;
           };
@@ -302,6 +310,12 @@
               inherit pkgs;
               inherit (mt) evalMikrotik evalMikrotikFleet evalMikrotikFleetConfigs evalMikrotikRaw mkSecret generators;
             };
+
+            # The `.rsc` parser's own suite: the round trip over the renderer's
+            # goldens and a real 7.15.3 export, and the upsert property (applying
+            # the patch to the model of the first file yields the second). It
+            # runs in the package's check phase, so this check is that build.
+            rsc = config.packages.rsc;
           };
 
           devShells.default = pkgs.mkShell {

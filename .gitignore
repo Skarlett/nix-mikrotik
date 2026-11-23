@@ -4,3 +4,5 @@ result-*
 *.rsc.local
 __pycache__/
 *.pyc
+# Rust build output for the .rsc parser crate
+rsc/target/
