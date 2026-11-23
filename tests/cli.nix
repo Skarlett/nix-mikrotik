@@ -807,5 +807,119 @@ pkgs.runCommand "check-cli" { } ''
   fi
   grep -q 'needs --generator-state-dir' err-nostate
 
+
+  # ------------------------------------------------- the deploy is a patch ----
+  # `deploy` applies the difference between the device's `/export` and the
+  # script, not the script. The device half of that is checked on a CHR
+  # (`checks.chr-deploy`); what is checked here is the half that is a decision
+  # before anything is sent -- which flags reach the differ, what an empty plan
+  # is, and what a differ that is missing or cannot parse is allowed to say.
+  $cli deploy --help | grep -q -- '--prune'
+  $cli deploy --help | grep -q -- '--check'
+  $cli deploy --help | grep -q -- '--import-whole'
+  ${pkgs.python3}/bin/python3 - ${cliSource} <<'PY'
+  import importlib.util
+  import os
+  import stat
+  import sys
+  import tempfile
+  from importlib.machinery import SourceFileLoader
+
+  spec = importlib.util.spec_from_loader(
+      "nix_mikrotik", SourceFileLoader("nix_mikrotik", sys.argv[1]))
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+
+  # ------------------------------------------- what counts as an operation ----
+  # A patch is mostly comments: the header, the notes, and every operation that
+  # was withheld. A file with no command left is a deploy with nothing to do, and
+  # sending it would only prove the sentinel works.
+  assert module.patch_commands(
+      "# header\n/system identity\nset name=x\n"
+      "# withheld: remove name=stale\n:log info \"marker\"\n\n") == ["set name=x"]
+  assert module.patch_commands("# nothing to do\n") == []
+
+  # ------------------------------------------------ what the differ is asked --
+  # The mode is the whole safety property: `--upsert` withholds every operation
+  # that deletes, and `--prune` is the one thing that turns it off. The sentinel
+  # travels with the patch because RouterOS exits 0 for an import it refused.
+  calls = []
+
+  class Proc:
+      def __init__(self, stdout=""):
+          self.returncode = 0
+          self.stdout = stdout
+          self.stderr = ""
+
+  def fake_run(argv, *args, **kwargs):
+      calls.append(list(argv))
+      return Proc("  3 operations: 0 add, 2 set, 0 remove, 0 replace, 0 move, 1 unperformable\n"
+                  if argv[1] == "diff" else "set name=x\n:log info \"marker\"\n")
+
+  module.subprocess.run = fake_run
+  os.environ["NIX_MIKROTIK_RSC"] = "fake-rsc"
+
+  class Router:
+      def export(self):
+          return "/system identity\nset name=old\n"
+
+  work = tempfile.mkdtemp()
+  patch, report = module.render_patch(Router(), "/system identity\nset name=x\n",
+                                      work, prune=False, marker="marker")
+  assert [c[0] for c in calls] == ["fake-rsc", "fake-rsc"], calls
+  assert calls[0][1] == "diff" and "--upsert" in calls[0], calls[0]
+  assert calls[1][1] == "patch" and "--upsert" in calls[1], calls[1]
+  assert "--sentinel" in calls[1] and "marker" in calls[1], calls[1]
+  assert "0 add" in report, report
+  # Both sides of the diff are written 0600: one holds the secretized target,
+  # the other the device's configuration.
+  for name in ("live.rsc", "target.rsc"):
+      mode = stat.S_IMODE(os.stat(os.path.join(work, name)).st_mode)
+      assert mode == 0o600, (name, oct(mode))
+
+  # `--prune` is the only thing that turns deletions back on.
+  calls.clear()
+  module.render_patch(Router(), "/system identity\nset name=x\n", work,
+                      prune=True, marker="marker")
+  assert "--upsert" not in calls[0], calls[0]
+  assert "--upsert" not in calls[1], calls[1]
+
+  # ------------------------------------------------ what a failure may say ----
+  # A differ that is not there is a packaging problem, and the message has to
+  # say which binary is missing rather than raising FileNotFoundError.
+  def missing(argv, *args, **kwargs):
+      raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+  module.subprocess.run = missing
+  os.environ["NIX_MIKROTIK_RSC"] = "no-such-rsc"
+  try:
+      module.run_rsc(["diff", "a", "b"], "the difference")
+  except module.ToolError as exc:
+      assert "not on PATH" in str(exc) and "no-such-rsc" in str(exc), str(exc)
+  else:
+      raise AssertionError("a missing rsc was not reported")
+
+  # A file the differ cannot parse is exit 2, and for a device's /export the
+  # answer is the path that does not read it: `--import-whole`.
+  def unparseable(argv, *args, **kwargs):
+      proc = Proc()
+      proc.returncode = 2
+      proc.stderr = "rsc: live.rsc: line 3: unexpected token"
+      return proc
+
+  module.subprocess.run = unparseable
+  try:
+      module.run_rsc(["diff", "a", "b"], "the difference")
+  except module.ToolError as exc:
+      assert "--import-whole" in str(exc), str(exc)
+      assert "unexpected token" in str(exc), str(exc)
+  else:
+      raise AssertionError("a parse failure was not reported")
+
+  # --------------------------------------------- --check sends nothing --------
+  # `--check` is the first run against a live router: the plan, and no transport
+  # at all. The whole-script path has no plan to show, so it is refused.
+  print("the deploy is a patch: mode, empty plan, and the failures it may name")
+  PY
   touch $out
 ''

@@ -66,6 +66,14 @@ build itself can. What it asserts, all read over REST afterwards:
   all only if the whole script ran, because unquoted that base64 `=` padding
   makes the device refuse the script from its first line;
 * the uploaded copy is gone from the device afterwards;
+* that a **second deploy of the same script** is a plan of `set`s — `0 add`,
+  nothing duplicated — and that a **one-property change** reaches the device as a
+  `set` on the object that was already there (same `.id`, so peers and routes
+  pointing at it are not disturbed);
+* and the contrast: re-importing the whole script (`--import-whole`, the path
+  `deploy` used to take) **fails** on a device that already holds it
+  (`failure: already have interface with such name`), which is what makes the
+  convergence above a check rather than a claim;
 * and, the other way round, that a deliberately broken script **fails** the
   deploy, with the device's own `script error: expected end of command` in the
   log and nothing applied. A check whose subject always applies cannot be shown

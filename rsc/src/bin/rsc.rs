@@ -1,6 +1,6 @@
 //! `rsc` — parse, diff and patch MikroTik RouterOS configuration scripts.
 
-use rsc::diff::{diff, Diff, Options};
+use rsc::diff::{diff, Diff, Options, Removals};
 use rsc::model::SectionKind;
 use rsc::patch::{render, RenderOptions};
 use rsc::simulate;
@@ -22,6 +22,9 @@ OPTIONS
   --sentinel M  append `:log info \"M\"` to the patch: the only positive
                 evidence that a device ran the whole file
   --all         diff: also list sections with no changes
+  --upsert      adds and sets only: every operation that would delete is
+                withheld and reported instead (the mode a deploy uses when it
+                cannot own the device's objects)
   --keep-derived
                 do not ignore properties RouterOS computes (ip address network)
 
@@ -55,7 +58,13 @@ fn main() -> ExitCode {
     let sentinel = flag_value(rest, "--sentinel");
     let opts = Options {
         ignore_derived: !flags.iter().any(|f| f == "--keep-derived"),
+        removals: if flags.iter().any(|f| f == "--upsert") {
+            Removals::Withhold
+        } else {
+            Removals::Apply
+        },
     };
+    let upsert = opts.removals == Removals::Withhold;
 
     match cmd.as_str() {
         "parse" => {
@@ -169,6 +178,12 @@ fn main() -> ExitCode {
                         stats.replaced,
                         stats.moved
                     );
+                    if upsert {
+                        println!(
+                            "  upsert: {} operation(s) withheld -- the patch adds and sets, and deletes nothing",
+                            stats.withheld
+                        );
+                    }
                     println!(
                         "  model: {} -> {} ({} sections, {} objects)",
                         count_objects(&ca),
@@ -177,7 +192,11 @@ fn main() -> ExitCode {
                         count_objects(&cb)
                     );
                     if problems.is_empty() {
-                        println!("  OK: the patch reaches the target exactly");
+                        println!("{}", if upsert {
+                            "  OK: the patch reaches everything the target declares (deletions withheld)"
+                        } else {
+                            "  OK: the patch reaches the target exactly"
+                        });
                         ExitCode::SUCCESS
                     } else {
                         println!("  MISMATCH: {} difference(s)", problems.len());
@@ -289,6 +308,12 @@ fn print_diff(a: &str, b: &str, d: &Diff, all: bool) {
         stats.moved,
         stats.unresolvable
     );
+    if stats.withheld > 0 {
+        println!(
+            "  {} withheld (upsert): these would delete, and an upsert does not",
+            stats.withheld
+        );
+    }
     println!(
         "  exact: {}",
         if d.is_exact() {
@@ -301,7 +326,7 @@ fn print_diff(a: &str, b: &str, d: &Diff, all: bool) {
         println!("  note: {}", note);
     }
     for section in &d.sections {
-        if section.ops.is_empty() && !all {
+        if section.ops.is_empty() && section.withheld.is_empty() && !all {
             continue;
         }
         println!();
@@ -312,7 +337,10 @@ fn print_diff(a: &str, b: &str, d: &Diff, all: bool) {
         for op in &section.ops {
             println!("  {}", op.describe());
         }
-        if section.ops.is_empty() {
+        for op in &section.withheld {
+            println!("  withheld: {}", op.describe());
+        }
+        if section.ops.is_empty() && section.withheld.is_empty() {
             println!("  (no changes)");
         }
     }
@@ -416,7 +444,7 @@ fn diff_json(a: &str, b: &str, d: &Diff) -> String {
         .collect();
     let stats = d.stats();
     format!(
-        "{{\"from\":\"{}\",\"to\":\"{}\",\"exact\":{},\"stats\":{{\"add\":{},\"set\":{},\"remove\":{},\"replace\":{},\"move\":{},\"unperformable\":{}}},\"sections\":[{}]}}",
+        "{{\"from\":\"{}\",\"to\":\"{}\",\"exact\":{},\"stats\":{{\"add\":{},\"set\":{},\"remove\":{},\"replace\":{},\"move\":{},\"unperformable\":{},\"withheld\":{}}},\"sections\":[{}]}}",
         json_escape(a),
         json_escape(b),
         d.is_exact(),
@@ -426,6 +454,7 @@ fn diff_json(a: &str, b: &str, d: &Diff) -> String {
         stats.replaced,
         stats.moved,
         stats.unresolvable,
+        stats.withheld,
         sections.join(",")
     )
 }

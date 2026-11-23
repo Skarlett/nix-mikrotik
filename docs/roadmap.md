@@ -9,18 +9,20 @@ measured on a device rather than assumed.
   checks deploy to, or the other way round. Bumping the pin to the version the
   table is walked from closes it; the licence and the deploy fixture need the
   same pass ([Maintaining the menu table](maintaining-the-menu-table.md)).
-* **a real diff/reconcile**: the parser and the differ now exist
-  ([the `.rsc` parser](rsc-parser.md)): `rsc diff` and `rsc patch` turn two
-  scripts into the console commands that take one to the other, and `rsc verify`
-  proves the patch reaches the target. What is missing is the last step — nothing
-  in the deploy path uses it yet, because that needs a decision about where the
-  "current state" comes from (a fresh `/export`, or the previous generation's
-  script). `nix-mikrotik diff` is still textual.
-* **idempotent import**: still true of `deploy`; the convergent path is the patch
-  `rsc` emits, which is not wired in yet. `--reset` remains the only convergent
-  mode the CLI itself offers, and it is destructive.
+* **a real diff/reconcile**: the parser and the differ exist
+  ([the `.rsc` parser](rsc-parser.md)) and `deploy` now applies the *difference*
+  between the device's `/export` and the script, so a second deploy converges
+  instead of duplicating ([Deploying](deploying.md)). What is still missing is
+  the **ownership predicate**: the patch knows what the device holds and what the
+  script declares, but not which of the device's objects this repository owns,
+  so deletions are withheld unless `--prune` says otherwise.
+* **idempotent import**: closed for the default path — `deploy` computes a patch
+  and a repeat is a plan of `set`s (measured: a second deploy of the CHR fixture
+  is `0 add, 2 set, 0 remove`, and the object handles do not change). The
+  whole-script path (`--import-whole`, and `--reset`) is still a one-shot.
 * **`/export`-based import of existing routers**: the migration path is still
-  "read the export, write the module by hand".
+  "read the export, write the module by hand". The differ reads an export, which
+  makes a *converge* of an existing router possible; it does not write the module.
 * **the examples on a CHR**: they describe a router with `ether2` … `ether5` and
   `sfp1`, and a stock CHR has one ethernet port, so an `/ip address …
   interface=ether2` line is refused at runtime (`script error: input does not

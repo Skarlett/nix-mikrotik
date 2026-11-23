@@ -1,8 +1,8 @@
-{ lib, stdenv, python3, openssh, nix, makeWrapper }:
+{ lib, stdenv, python3, openssh, nix, rsc, makeWrapper }:
 
 stdenv.mkDerivation {
   pname = "nix-mikrotik";
-  version = "0.2.0";
+  version = "0.3.0";
 
   src = ./.;
 
@@ -23,12 +23,14 @@ stdenv.mkDerivation {
     runHook postInstall
   '';
 
-  # What the tool needs from outside: an ssh client for the transport, and nix
+  # What the tool needs from outside: an ssh client for the transport, nix
   # itself for `render`, which builds the script rather than reimplementing the
-  # renderer.
+  # renderer, and `rsc` -- the differ `deploy` computes its patch with. Both
+  # halves of a deploy come from this one package, so a consumer that pins
+  # nix-mikrotik gets the differ that matches it.
   postFixup = ''
     wrapProgram $out/bin/nix-mikrotik \
-      --prefix PATH : ${lib.makeBinPath [ openssh nix ]}
+      --prefix PATH : ${lib.makeBinPath [ openssh nix rsc ]}
   '';
 
   meta = {

@@ -62,6 +62,7 @@ import base64
 import http.server
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,9 @@ import urllib.request
 # and what it must not say. See `import_failed` in pkgs/nix_mikrotik.py.
 PREFIX_WARNING = "may already have been applied"
 VERIFIED_PREFIX = "verified: identity is"
+# The differ's own count line for a plan with nothing to create: the shape a
+# second deploy of the same script has to produce.
+ADD_NONE = "0 add"
 
 
 class Failure(Exception):
@@ -308,7 +312,8 @@ def bootstrap(rest: Rest, host: str, ssh_port: int, slirp_host: str,
 
 def deploy(cli: str, script: str, host: str, ssh_port: int, key: str,
            secrets: list[str], workdir: str, generators: str | None = None,
-           state_dir: str | None = None) -> subprocess.CompletedProcess:
+           state_dir: str | None = None,
+           extra: list[str] | None = None) -> subprocess.CompletedProcess:
     """Run the deploy tool the way an operator does, secrets and all.
 
     With `--generators`, the values come from the state directory the manifest
@@ -322,6 +327,8 @@ def deploy(cli: str, script: str, host: str, ssh_port: int, key: str,
             "--key", key, "--verify"]
     if generators:
         argv += ["--generators", generators, "--generator-state-dir", state_dir]
+    if extra:
+        argv += extra
     for item in secrets:
         name, value = item.split("=", 1)
         # A secret name is `<generator>/<file>`, which is a path, not a file
@@ -657,6 +664,92 @@ def main() -> int:
             print(f"  note: {len(incidental)} `executing script from sshd failed` "
                   "line(s) -- RouterOS logs one for any ssh command that exits "
                   "non-zero, which the deploy's retried file removal does")
+
+        # ------------------------------------------------------------ upsert --
+        # `deploy` applies the difference between the device's own `/export` and
+        # the script, not the script itself. What that buys is only visible on a
+        # *second* run: `/import` of `add` lines is not idempotent, so the old
+        # path could not be run twice against a device that already held the
+        # configuration. These are the assertions that separate the two.
+        print("deploying the same script again (upsert)")
+        before_counts = {
+            "bridge": len(rest.menu("/interface/bridge")),
+            "pool": len(rest.menu("/ip/pool")),
+            "wireguard": len(rest.menu("/interface/wireguard")),
+            "address": len(rest.get("/ip/address")[1]),
+            "dhcp-server": len(rest.menu("/ip/dhcp-server")),
+            "dns-static": len(rest.menu("/ip/dns/static")),
+        }
+        wg_id = rest.menu("/interface/wireguard").get("wg.check", {}).get(".id")
+        proc = deploy(args.cli, args.script, args.host, args.ssh_port,
+                      os.path.join(workdir, "key"), args.secret, workdir,
+                      generators=args.generators, state_dir=state_dir)
+        output = proc.stdout + proc.stderr
+        run.check("a second deploy of the same script succeeds (rc 0)",
+                  proc.returncode == 0, f"rc {proc.returncode}")
+        # Either shape is the upsert working: a plan of sets only, or nothing at
+        # all. What must not appear is an `add`, which is what re-importing the
+        # script would emit for every object it already made.
+        run.check("... and it computes no adds",
+                  "no changes" in output or ADD_NONE in output,
+                  " | ".join(l.strip() for l in output.splitlines()
+                             if "operations:" in l or "no changes" in l) or "no summary")
+        after_counts = {
+            "bridge": len(rest.menu("/interface/bridge")),
+            "pool": len(rest.menu("/ip/pool")),
+            "wireguard": len(rest.menu("/interface/wireguard")),
+            "address": len(rest.get("/ip/address")[1]),
+            "dhcp-server": len(rest.menu("/ip/dhcp-server")),
+            "dns-static": len(rest.menu("/ip/dns/static")),
+        }
+        run.check("... and nothing was duplicated on the device",
+                  after_counts == before_counts,
+                  f"{before_counts} -> {after_counts}")
+
+        # A one-property change, which is the other half of "upsert": the object
+        # is *set*, not re-created, so its handle on the device survives.
+        print("deploying a one-property change")
+        changed = os.path.join(workdir, "changed.rsc")
+        with open(args.script, "r", encoding="utf-8") as handle:
+            original = handle.read()
+        if "listen-port=51820" not in original:
+            raise Failure("this check's fixture no longer carries listen-port=51820, "
+                          "so the one-property change below would test nothing")
+        with open(changed, "w", encoding="utf-8") as handle:
+            handle.write(original.replace("listen-port=51820", "listen-port=51821"))
+        proc = deploy(args.cli, changed, args.host, args.ssh_port,
+                      os.path.join(workdir, "key"), args.secret, workdir,
+                      generators=args.generators, state_dir=state_dir)
+        output = proc.stdout + proc.stderr
+        run.check("a changed property deploys (rc 0)", proc.returncode == 0,
+                  f"rc {proc.returncode}")
+        wg_after = rest.menu("/interface/wireguard").get("wg.check", {})
+        run.check("the device holds the changed value",
+                  wg_after.get("listen-port") == "51821",
+                  f"listen-port={wg_after.get('listen-port')}")
+        # The interface is not removed and re-added: same handle, and the peers
+        # and routes pointing at it are not disturbed.
+        run.check("... on the object that was already there, not a re-created one",
+                  bool(wg_id) and wg_after.get(".id") == wg_id,
+                  f"{wg_id} -> {wg_after.get('.id')}")
+        run.check("... applied as a `set`: the plan has no add and no remove",
+                  bool(re.search(r"\b0 add\b", output)) and bool(re.search(r"\b0 remove\b", output)),
+                  " | ".join(l.strip() for l in output.splitlines()
+                             if "operations:" in l) or "no summary")
+
+        # And the contrast, which is what makes the two above a check: the path
+        # this replaces, re-importing the whole script, fails on a device that
+        # already holds it.
+        print("re-importing the whole script (the path the patch replaces)")
+        proc = deploy(args.cli, args.script, args.host, args.ssh_port,
+                      os.path.join(workdir, "key"), args.secret, workdir,
+                      generators=args.generators, state_dir=state_dir,
+                      extra=["--import-whole"])
+        output = proc.stdout + proc.stderr
+        run.check("re-importing the same script fails instead of duplicating it",
+                  proc.returncode != 0, f"rc {proc.returncode}")
+        run.contains("... and the failure says a prefix may have been applied",
+                     output, PREFIX_WARNING)
 
         # --------------------------------------------------------- refusals --
         if args.broken_script:

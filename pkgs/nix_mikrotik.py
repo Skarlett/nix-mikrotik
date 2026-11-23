@@ -9,8 +9,18 @@ store:
   render      build a configuration's script through nix and copy it out
   list-secrets  list the placeholders a script still contains
   secretize   substitute real values into a private temporary copy
-  deploy      secretize, upload, import, verify, and remove the file again
-  diff        export the device's live config and diff it against the script
+  deploy      secretize, diff against the device, import the difference, verify
+  diff        export the device's live config and diff it textually against the script
+
+`deploy` applies the *difference* between the device's own `/export` and the
+script, computed by `rsc` (the crate in `rsc/`), rather than re-importing every
+line. That is what makes a second deploy safe: `/import` of `add` lines is not
+idempotent -- a repeated `add` makes a second object, and the device refuses the
+script from that point on -- while a patch that says `set [find name=…]` for an
+object that already exists converges. Deletions are withheld by default
+(`--prune` applies them): an `/export` carries the whole configuration, so
+"not in the target" includes the address the deploy itself is talking over.
+`--import-whole` keeps the old path, and `--check` prints the plan and stops.
 
 RouterOS cannot run sops-nix, so a secret cannot be "activated" onto the
 device the way it is onto a NixOS host. It is delivered here instead: the value
@@ -1131,7 +1141,6 @@ def new_sentinel() -> str:
     """A per-deploy marker, so an old log entry cannot be mistaken for this one."""
     return f"{SENTINEL_PREFIX}-{os.urandom(8).hex()}"
 
-
 def sentinel_line(marker: str) -> str:
     """The line appended to the uploaded copy, and why it is there.
 
@@ -1144,6 +1153,109 @@ def sentinel_line(marker: str) -> str:
     device, and the marker is unique per deploy.
     """
     return f'\n:log info "{marker}"\n'
+
+
+# --------------------------------------------------------------------------
+# the differ
+# --------------------------------------------------------------------------
+
+def rsc_binary() -> str:
+    """The `rsc` differ this tool drives.
+
+    It ships beside `nix-mikrotik` in the same package (the flake wraps both into
+    one PATH), so the plain name is the normal case. `NIX_MIKROTIK_RSC` is for
+    the test harness, which runs the tool from a worktree against a binary it
+    just built rather than through the wrapper.
+    """
+    return os.environ.get("NIX_MIKROTIK_RSC") or "rsc"
+
+
+def run_rsc(argv: list[str], what: str) -> str:
+    """Run the differ, and turn its failures into this tool's own.
+
+    Exit 2 is a parse error on one of the two files: the device's `/export` is
+    the one that surprises a parser (a script block, a menu the model does not
+    know), and it is the file the operator cannot edit -- so the message names
+    the escape hatch instead of leaving a Rust diagnostic to read.
+    """
+    try:
+        proc = subprocess.run([rsc_binary(), *argv], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise ToolError(
+            f"`{rsc_binary()}` is not on PATH: it is the differ this deploy "
+            "computes its patch with, and it ships with nix-mikrotik -- run the "
+            "packaged tool rather than the script") from None
+    if proc.returncode == 2:
+        raise ToolError(
+            f"rsc could not parse a file while computing {what}:\n"
+            f"{proc.stderr.strip()}\n"
+            "if it is the device's /export, pass --import-whole: importing the "
+            "script is the path that does not read the device's configuration")
+    if proc.returncode != 0:
+        raise ToolError(f"rsc {argv[0]} failed ({proc.returncode}):\n{proc.stderr.strip()}")
+    return proc.stdout
+
+
+def patch_commands(text: str) -> list[str]:
+    """The lines of a patch a device would actually run.
+
+    A patch is mostly comments -- the header, the notes, and every operation
+    that was withheld -- and a file with none of them left is a deploy with
+    nothing to do. Counting them is also what keeps an empty patch off the
+    device: uploading and importing it would only prove the sentinel works.
+    """
+    commands = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("/"):
+            continue
+        if stripped.startswith(":"):
+            # `:log info "<sentinel>"` is a command, but it is this tool's own
+            # proof-of-run, not a change: a patch made only of one is empty.
+            continue
+        commands.append(stripped)
+    return commands
+
+
+def render_patch(router: "Router", text: str, workdir: str, prune: bool,
+                 marker: str) -> tuple[str, str]:
+    """Diff the device against `text` and return (patch, report).
+
+    The device is the source of "what is there now": a fresh `/export`, which is
+    the only statement about the device that does not go through this tool's own
+    record of what it thinks it deployed. The script is the target. The differ
+    turns the two into the console commands in between, and the sentinel it
+    appends is the same proof-of-run the whole-script path uses -- RouterOS
+    exits 0 for an import it refused, so the log line is the only positive
+    evidence that the patch ran to the end.
+
+    `prune` decides what happens to the operations that delete. Without it the
+    patch is an *upsert*: adds and sets only. That is not caution for its own
+    sake -- an `/export` carries the device's whole configuration, so "not in
+    the target" includes the address this deploy is talking to the device over,
+    the ethernet interfaces, and anything somebody added by hand. Deleting those
+    is what "exact" means, and it is not this tool's decision to make.
+    """
+    live_path = os.path.join(workdir, "live.rsc")
+    target_path = os.path.join(workdir, "target.rsc")
+    for path, content in ((live_path, router.export()), (target_path, text)):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+
+    mode = [] if prune else ["--upsert"]
+    report = run_rsc(["diff", live_path, target_path, *mode], "the difference")
+    patch = run_rsc(["patch", live_path, target_path, *mode, "--sentinel", marker],
+                    "the patch")
+    return patch, report
+
+
+def patch_summary(report: str) -> str:
+    """The one line of `rsc diff`'s report that says how much work there is."""
+    for line in report.splitlines():
+        if "operations:" in line:
+            return line.strip()
+    return "the differ reported no operations"
 
 
 def import_failed(detail: str) -> str:
@@ -1228,10 +1340,49 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     remote = None
     marker = new_sentinel()
     try:
+        # Which script the device is given is the whole of this change. By
+        # default it is the *difference* between the device's own /export and
+        # the target, computed here and applied as a patch; `--import-whole`
+        # keeps the old path, which re-imports every line and is only correct on
+        # a device that is empty or already in that exact state.
+        whole = args.reset or args.import_whole
+        if whole:
+            body = text
+            summary = f"{len(text)} bytes, imported whole"
+        else:
+            patch, report = render_patch(router, text, workdir, args.prune, marker)
+            if args.check:
+                print(report, end="" if report.endswith("\n") else "\n")
+                print("check: nothing was sent to the device", file=sys.stderr)
+                return 1 if patch_commands(patch) else 0
+            commands = patch_commands(patch)
+            if not commands:
+                print("no changes: the device already holds this configuration",
+                      file=sys.stderr)
+                print(report, end="" if report.endswith("\n") else "\n",
+                      file=sys.stderr)
+                if args.verify:
+                    _verify_identity(router, args)
+                return 0
+            body = patch
+            summary = patch_summary(report)
+            print(f"{summary}", file=sys.stderr)
+            if not args.prune:
+                print("removals are withheld (upsert): pass --prune to apply "
+                      "the operations that delete", file=sys.stderr)
+
+        if args.check:
+            # Only the diff path can check without sending anything; the
+            # whole-script path has no plan to show.
+            raise ToolError("--check needs the diff path: do not combine it with "
+                            "--import-whole or --reset")
+
         staged = os.path.join(workdir, DEFAULT_SCRIPT_NAME)
         fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text + sentinel_line(marker))
+            # The differ already appended the sentinel to a patch; the
+            # whole-script path has to add its own.
+            handle.write(body if whole is False else body + sentinel_line(marker))
 
         print(f"uploading to {args.user}@{args.host}:{args.port}", file=sys.stderr)
         remote = router.upload(staged)
@@ -1259,14 +1410,18 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         shutil.rmtree(workdir, ignore_errors=True)
 
     if args.verify:
-        identity = router.identity()
-        if identity is None:
-            raise ToolError("could not read /system identity after deploy")
-        if args.expect_hostname and identity != args.expect_hostname:
-            raise ToolError(
-                f"identity is '{identity}', expected '{args.expect_hostname}'")
-        print(f"verified: identity is '{identity}'")
+        _verify_identity(router, args)
     return 0
+
+
+def _verify_identity(router: Router, args: argparse.Namespace) -> None:
+    identity = router.identity()
+    if identity is None:
+        raise ToolError("could not read /system identity after deploy")
+    if args.expect_hostname and identity != args.expect_hostname:
+        raise ToolError(
+            f"identity is '{identity}', expected '{args.expect_hostname}'")
+    print(f"verified: identity is '{identity}'")
 
 
 def _wait_for_router(router: Router, timeout: int) -> None:
@@ -1388,7 +1543,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_prompt_arguments(p)
     p.set_defaults(func=cmd_secretize)
 
-    p = sub.add_parser("deploy", help="secretize, upload, import and verify")
+    p = sub.add_parser("deploy", help="secretize, diff, import and verify")
     p.add_argument("script")
     p.add_argument("--host", required=True)
     p.add_argument("--user", default="admin")
@@ -1423,6 +1578,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset", action="store_true",
                    help="reset-configuration with the script (destructive)")
     p.add_argument("--yes", action="store_true", help="confirm --reset")
+    p.add_argument("--prune", action="store_true",
+                   help="apply the operations that delete as well: the patch "
+                        "then takes the device to exactly the script, including "
+                        "removing what the script does not declare (the "
+                        "management address and the ethernet interfaces are "
+                        "declared by /export and not by most scripts)")
+    p.add_argument("--import-whole", action="store_true",
+                   help="import the whole script instead of its difference: the "
+                        "path for a device whose /export the differ cannot read, "
+                        "and the one that is not idempotent")
+    p.add_argument("--check", action="store_true",
+                   help="print the difference and exit (1 if there is one, 0 if "
+                        "the device already holds the configuration); nothing is "
+                        "uploaded -- the first run against a live router")
     p.add_argument("--wait", type=int, default=180,
                    help="seconds to wait for a reset device (default: 180)")
     p.add_argument("--verify", action="store_true",
