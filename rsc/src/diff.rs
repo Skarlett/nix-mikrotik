@@ -1,0 +1,1496 @@
+//! The differ: two configurations in, the operations that turn the first into
+//! the second.
+//!
+//! The hard part is not comparing properties, it is *addressing* objects. An
+//! `/export` carries no `.id`, so a patch has to name what it changes the way a
+//! human would in the console. Four strategies, one per section:
+//!
+//! * [`Strategy::Keyed`] — the menu has a stable identity (a name, an address
+//!   plus interface). Match by it, emit `set [find …]`, `add`, `remove`.
+//! * [`Strategy::CommentKeyed`] — an ordered menu whose every object carries a
+//!   comment. The comment is the only stable handle RouterOS offers on a
+//!   firewall rule, so it is used as the key, and `place-before=` plus `move`
+//!   restore the declared order.
+//! * [`Strategy::Positional`] — an ordered menu with no handle at all. Nothing in
+//!   the text can address rule 3 of five, so the section is removed and rebuilt
+//!   in order. Exact, and churny — which is the honest trade.
+//! * [`Strategy::Singleton`] — one settings object. Properties can be added and
+//!   changed, never removed: see [`Op::Unresolvable`].
+//!
+//! Property comparison is on decoded text, so `comment="a b"` and
+//! `comment=a b` compare equal, and the patch re-prints whichever spelling the
+//! *target* file used.
+
+use crate::identity::{identity_for, Identity};
+use crate::model::{Object, Origin, Prop, Section, SectionKind, Selector};
+use crate::Config;
+use std::collections::HashSet;
+
+/// Knobs that change what counts as a difference.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// Ignore properties RouterOS derives from another property, so that a file
+    /// which omits them is not seen as wanting them removed. `/ip address`
+    /// carries `network=`, which the device computes from `address=`.
+    pub ignore_derived: bool,
+    /// Whether the plan may delete objects.
+    ///
+    /// `Apply` is the diff: it says what turns `a` into `b`, deletions
+    /// included. `Withhold` is the *upsert*: adds and sets only, for a deploy
+    /// that has no ownership predicate and must not remove what it did not
+    /// create — an `/export` carries the device's whole configuration, so
+    /// "not in the target" is not the same as "not wanted" (the management
+    /// address, the ethernet interfaces, a rule somebody added by hand).
+    pub removals: Removals,
+}
+
+/// Whether a diff may emit deletions. See [`Options::removals`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Removals {
+    /// Deletions are part of the plan.
+    #[default]
+    Apply,
+    /// The plan is upserts only; deletions are reported but not emitted.
+    Withhold,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            ignore_derived: true,
+            removals: Removals::Apply,
+        }
+    }
+}
+
+/// How a section is compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strategy {
+    Keyed,
+    CommentKeyed,
+    Positional,
+    Singleton,
+    /// Lines the model could not interpret; reported, never patched.
+    Unmodelled,
+}
+
+impl Strategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Strategy::Keyed => "keyed",
+            Strategy::CommentKeyed => "comment-keyed",
+            Strategy::Positional => "positional",
+            Strategy::Singleton => "singleton",
+            Strategy::Unmodelled => "unmodelled",
+        }
+    }
+}
+
+/// Why an object is being added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddReason {
+    /// The object is new.
+    New,
+    /// The object exists but a property has to disappear, and RouterOS cannot
+    /// unset a property — so it is removed and re-created.
+    Replaced,
+}
+
+/// One operation, in the order it has to run.
+#[derive(Debug, Clone)]
+pub enum Op {
+    Add {
+        section: String,
+        props: Vec<Prop>,
+        /// Insert before the object this selector addresses; `None` appends.
+        place_before: Option<Selector>,
+        reason: AddReason,
+    },
+    Set {
+        section: String,
+        selector: Selector,
+        changes: Vec<Prop>,
+        /// Whether this `set` only writes properties the live object does not
+        /// carry at all -- so the export can neither confirm nor refute it.
+        /// See [`Diff::is_assertion_only`].
+        assertion: bool,
+    },
+    Remove {
+        section: String,
+        selector: Selector,
+        /// Whether the selector names the object (`find …`) rather than
+        /// counting to it.
+        exact: bool,
+    },
+    Move {
+        section: String,
+        selector: Selector,
+        to: usize,
+    },
+    /// A `set` on a singleton menu.
+    SingletonSet {
+        section: String,
+        changes: Vec<Prop>,
+        /// See [`Op::Set`]'s `assertion`.
+        assertion: bool,
+    },
+    /// A property the target file drops that no patch can drop.
+    Unresolvable {
+        section: String,
+        selector: Selector,
+        prop: String,
+    },
+}
+
+impl Op {
+    pub fn section(&self) -> &str {
+        match self {
+            Op::Add { section, .. }
+            | Op::Set { section, .. }
+            | Op::Remove { section, .. }
+            | Op::Move { section, .. }
+            | Op::SingletonSet { section, .. }
+            | Op::Unresolvable { section, .. } => section,
+        }
+    }
+
+    /// Whether this operation only re-states a value the export cannot show.
+    pub fn is_assertion(&self) -> bool {
+        matches!(
+            self,
+            Op::Set {
+                assertion: true,
+                ..
+            } | Op::SingletonSet {
+                assertion: true,
+                ..
+            }
+        )
+    }
+
+    /// The object this operation addresses, when it addresses one.
+    ///
+    /// An `Add` has no selector of its own -- it creates the object the
+    /// selector would have found -- so the caller that needs one (a withheld
+    /// replacement is reported through the `Remove` beside it) looks at that.
+    pub fn selector(&self) -> Option<&Selector> {
+        match self {
+            Op::Set { selector, .. }
+            | Op::Remove { selector, .. }
+            | Op::Move { selector, .. }
+            | Op::Unresolvable { selector, .. } => Some(selector),
+            Op::Add { .. } | Op::SingletonSet { .. } => None,
+        }
+    }
+
+    /// A one-line description, used by the human report.
+    pub fn describe(&self) -> String {
+        match self {
+            Op::Add { props, reason, .. } => {
+                let what = match reason {
+                    AddReason::New => "add",
+                    AddReason::Replaced => "add (replaces)",
+                };
+                format!("{} {}", what, render_props(props))
+            }
+            Op::Set {
+                selector,
+                changes,
+                assertion,
+                ..
+            } => format!(
+                "{} {} {}",
+                if *assertion { "assert" } else { "set" },
+                selector,
+                render_props(changes)
+            ),
+            Op::Remove {
+                selector, exact, ..
+            } => {
+                let how = if *exact { "" } else { " (by position)" };
+                format!("remove {}{}", selector, how)
+            }
+            Op::Move { selector, to, .. } => format!("move {} to {}", selector, to),
+            Op::SingletonSet {
+                changes, assertion, ..
+            } => format!(
+                "{} {}",
+                if *assertion { "assert" } else { "set" },
+                render_props(changes)
+            ),
+            Op::Unresolvable { selector, prop, .. } => {
+                format!(
+                    "cannot reset {} on {}: RouterOS has no unset",
+                    prop, selector
+                )
+            }
+        }
+    }
+}
+
+fn render_props(props: &[Prop]) -> String {
+    props
+        .iter()
+        .map(|p| p.raw.clone())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Per-section counts, for the report.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub added: usize,
+    pub changed: usize,
+    pub removed: usize,
+    pub replaced: usize,
+    pub moved: usize,
+    pub unresolvable: usize,
+    /// Operations the plan computed and did not emit, because they delete
+    /// (`Options::removals`). Counted separately: they are not part of the
+    /// patch, and a reader has to be told they exist.
+    pub withheld: usize,
+    /// Of the emitted operations, the ones that only re-state a value the
+    /// device's `/export` cannot show -- see [`Diff::is_assertion_only`].
+    pub asserted: usize,
+}
+
+impl Stats {
+    pub fn total(&self) -> usize {
+        self.added + self.changed + self.removed + self.replaced + self.moved + self.unresolvable
+    }
+}
+
+/// One section's share of the diff.
+#[derive(Debug, Clone)]
+pub struct SectionDiff {
+    pub path: String,
+    pub strategy: Strategy,
+    pub ops: Vec<Op>,
+    pub stats: Stats,
+    pub notes: Vec<String>,
+    /// Operations this section computed and did not emit, in the order they
+    /// would have run. See [`Options::removals`].
+    pub withheld: Vec<Op>,
+}
+
+/// The whole diff.
+#[derive(Debug, Clone, Default)]
+pub struct Diff {
+    pub sections: Vec<SectionDiff>,
+    pub notes: Vec<String>,
+}
+
+impl Diff {
+    pub fn is_empty(&self) -> bool {
+        self.sections.iter().all(|s| s.ops.is_empty())
+    }
+
+    pub fn stats(&self) -> Stats {
+        let mut total = Stats::default();
+        for s in &self.sections {
+            total.added += s.stats.added;
+            total.changed += s.stats.changed;
+            total.removed += s.stats.removed;
+            total.replaced += s.stats.replaced;
+            total.moved += s.stats.moved;
+            total.unresolvable += s.stats.unresolvable;
+            total.withheld += s.stats.withheld;
+        }
+        // Derived from the operations rather than from a counter the strategies
+        // have to remember to bump: a new place that pushes a `Set` then cannot
+        // forget to classify it.
+        // In properties, the unit the `set` count in the same line uses: one
+        // `set` op can carry a real change and an assertion together, and then
+        // the op is a change (it writes something the device can show).
+        total.asserted = self
+            .sections
+            .iter()
+            .flat_map(|s| s.ops.iter())
+            .filter(|op| op.is_assertion())
+            .map(|op| match op {
+                Op::Set { changes, .. } | Op::SingletonSet { changes, .. } => changes.len(),
+                _ => 0,
+            })
+            .sum();
+        total
+    }
+
+    /// Every operation that was computed and withheld, with its section.
+    ///
+    /// `Options::removals = Withhold` leaves these out of the patch, so the
+    /// caller that asked for an upsert still has to be told what the device
+    /// will keep that the target does not declare.
+    pub fn withheld(&self) -> impl Iterator<Item = (&str, &Op)> {
+        self.sections
+            .iter()
+            .flat_map(|s| s.withheld.iter().map(move |op| (s.path.as_str(), op)))
+    }
+
+    /// Whether the whole plan only re-states values the device's `/export`
+    /// cannot show.
+    ///
+    /// A device's export omits a WireGuard `private-key` (RouterOS never
+    /// exports it) and every property a script states at its default
+    /// (`disabled=no`). A diff against an export therefore asks for those
+    /// writes forever, and "no operations" is unreachable even on a device that
+    /// holds the configuration. This is the honest question underneath: would a
+    /// deploy change anything the device can report? When the answer is no, a
+    /// drift check has nothing to fail on, and the writes are assertions rather
+    /// than changes.
+    ///
+    /// It is false as soon as anything real is in the plan -- an add, a remove,
+    /// a move, a property that exists with another value, a section the differ
+    /// could not express, or anything withheld.
+    pub fn is_assertion_only(&self) -> bool {
+        // A section the plan could not apply is not converged, whatever else is
+        // in the plan: the target's objects are missing from the device. A
+        // *withheld removal* is different -- it is deliberately not applied, so
+        // the device holds everything the target declares, and the extra objects
+        // are reported on their own line.
+        if self
+            .sections
+            .iter()
+            .any(|s| s.notes.iter().any(|n| n.starts_with("UNAPPLIED:")))
+        {
+            return false;
+        }
+        self.sections.iter().all(|s| {
+            s.ops.iter().all(|op| match op {
+                Op::Set { assertion, .. } | Op::SingletonSet { assertion, .. } => *assertion,
+                // An `Unresolvable` is a property the target drops and no patch
+                // can drop: RouterOS has no unset, and a singleton has no object
+                // to re-create. Nothing a deploy does will remove it, so it is
+                // not something a drift check can fail on -- it is reported as
+                // its own `# rsc: cannot reset …` line.
+                Op::Unresolvable { .. } => true,
+                _ => false,
+            })
+        })
+    }
+
+    /// Whether every operation the diff emitted is one the device can perform
+    /// exactly. A positional remove is not: it assumes the device's list is the
+    /// one the source file describes.
+    pub fn is_exact(&self) -> bool {
+        !self.sections.iter().any(|s| {
+            s.ops.iter().any(|op| match op {
+                Op::Remove { exact: false, .. } => true,
+                Op::Unresolvable { .. } => true,
+                Op::Set { selector, .. } | Op::Move { selector, .. } => selector.is_positional(),
+                _ => false,
+            })
+        })
+    }
+}
+
+/// A property RouterOS computes from another, so that its absence in the target
+/// file does not mean "remove it".
+fn is_derived(menu: &str, key: &str) -> bool {
+    matches!(
+        (menu, key),
+        ("ip address", "network") | ("ipv6 address", "network")
+    )
+}
+
+/// How many objects of a section a selector addresses.
+///
+/// A composite key is built from the parts an object *carries*, so an object
+/// missing one part has a selector that is also satisfied by its neighbours: a
+/// route with no `routing-mark` shares `dst-address`+`gateway` with the marked
+/// one, and `remove [find dst-address=… gateway=…]` deletes both. The patch would
+/// say one removal and the device would do two, which is the failure this
+/// counts for.
+fn selector_hits(sel: &Selector, objects: &[Object]) -> usize {
+    objects
+        .iter()
+        .filter(|o| match sel {
+            Selector::Find(pairs) => pairs.iter().all(|(k, v)| {
+                crate::model::prop_text(&o.props, k) == Some(v.as_str())
+            }),
+            Selector::Named(n) => {
+                crate::model::prop_text(&o.props, "name") == Some(n.as_str())
+                    || o.selector.key() == sel.key()
+            }
+            Selector::Comment(c) => {
+                crate::model::prop_text(&o.props, "comment") == Some(c.as_str())
+            }
+            _ => o.selector.key() == sel.key(),
+        })
+        .count()
+}
+
+/// Whether every property in `props` is absent from the live object.
+///
+/// Absent is not the same as different: a property the export does not carry
+/// cannot be compared, so writing it is an assertion -- it may change the
+/// device, or it may already be that value, and no later `/export` will say
+/// which. A property that *is* exported and holds another value is a real
+/// change and stays one.
+fn only_absent(props: &[Prop], live: Option<&Object>) -> bool {
+    let Some(live) = live else {
+        return true;
+    };
+    props
+        .iter()
+        .all(|p| !live.props.iter().any(|q| q.key == p.key))
+}
+
+/// A property that can be reset to its default by writing an empty string.
+///
+/// Measured on 7.15.3: `set [find …] comment=""` clears a comment and the next
+/// `/export` omits it, while `ranges=""` is refused (`failure: no address
+/// ranges specified`) and `!ranges`, `!comment` and `unset` are syntax errors.
+/// So this list holds the properties a patch can drop in place; every other
+/// dropped property costs a re-create.
+fn is_resettable(_menu: &str, key: &str) -> bool {
+    key == "comment"
+}
+
+/// What has to change on one object: the properties to write, and the
+/// properties whose absence has to be *earned* by re-creating the object.
+fn property_changes(
+    menu: &str,
+    a: Option<&Object>,
+    b: Option<&Object>,
+    opts: &Options,
+) -> (Vec<Prop>, Vec<String>) {
+    let (mut changed, removed) = compare(a, b, menu, opts);
+    let mut must_replace = Vec::new();
+    for key in removed {
+        if is_resettable(menu, &key) {
+            changed.push(Prop::cleared(&key));
+        } else {
+            must_replace.push(key);
+        }
+    }
+    (changed, must_replace)
+}
+
+/// Compute the operations that turn `a` into `b`.
+pub fn diff(a: &Config, b: &Config, opts: &Options) -> Diff {
+    let mut out = Diff::default();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for section in &b.sections {
+        seen.insert(section.path.clone());
+        let left = a.section(&section.path);
+        out.sections
+            .push(diff_section(&section.path, left, Some(section), opts));
+    }
+    for section in &a.sections {
+        if seen.contains(&section.path) {
+            continue;
+        }
+        out.sections
+            .push(diff_section(&section.path, Some(section), None, opts));
+    }
+
+    if !b.preamble.is_empty() {
+        out.notes.push(format!(
+            "UNAPPLIED: {} command(s) before the first menu are kept verbatim and cannot be \
+             applied",
+            b.preamble.len()
+        ));
+    }
+
+    out
+}
+
+fn strategy_for(path: &str, a: Option<&Section>, b: Option<&Section>, _opts: &Options) -> Strategy {
+    let kind = b.or(a).map(|s| s.kind).unwrap_or(SectionKind::Objects);
+    if kind == SectionKind::Unmodelled {
+        return Strategy::Unmodelled;
+    }
+    if kind == SectionKind::Singleton {
+        return Strategy::Singleton;
+    }
+
+    let mut objects: Vec<&Object> = Vec::new();
+    if let Some(s) = a {
+        objects.extend(s.objects.iter());
+    }
+    if let Some(s) = b {
+        objects.extend(s.objects.iter());
+    }
+
+    // A menu has no handle at all only if the table says so *and* its objects
+    // came out positional. The table's default for a menu it does not know is
+    // `Ordered`, and most of those still have a `name` — `/interface vxlan` is
+    // one — so the objects decide: if they carry a key, the menu is keyed and a
+    // diff of it is a `set`, not a rebuild. A keyed menu whose source addressed
+    // its objects by index (`/port set 0 …`) keeps its keyed comparison too; it
+    // is the *selector* that is positional, and that is reported.
+    let ordered = matches!(identity_for(path), Identity::Ordered)
+        && objects.iter().any(|o| o.selector.is_positional());
+
+    if !ordered {
+        // A key that appears twice in one section cannot address one object.
+        let dup = |s: &Section| {
+            let mut keys: Vec<String> = s.objects.iter().map(|o| o.selector.key()).collect();
+            keys.sort();
+            keys.windows(2).any(|w| w[0] == w[1])
+        };
+        let dup = a.map(dup).unwrap_or(false) || b.map(dup).unwrap_or(false);
+        return if dup {
+            Strategy::Positional
+        } else {
+            Strategy::Keyed
+        };
+    }
+
+    // An ordered menu is addressable only through its comments, and only if
+    // every object has one and no two share it — `remove [find comment=x]`
+    // removes *all* matches, so a duplicate comment is not a handle.
+    let comments = |s: Option<&Section>| match s {
+        None => true,
+        Some(s) => {
+            if !s.objects.is_empty() && !s.has_comment_everywhere() {
+                return false;
+            }
+            let mut seen: Vec<String> = s.objects.iter().filter_map(|o| s.comment_of(o)).collect();
+            seen.sort();
+            !seen.windows(2).any(|w| w[0] == w[1])
+        }
+    };
+    if comments(a) && comments(b) {
+        Strategy::CommentKeyed
+    } else {
+        Strategy::Positional
+    }
+}
+
+fn diff_section(
+    path: &str,
+    a: Option<&Section>,
+    b: Option<&Section>,
+    opts: &Options,
+) -> SectionDiff {
+    let strategy = strategy_for(path, a, b, opts);
+    let mut out = SectionDiff {
+        path: path.to_string(),
+        strategy,
+        ops: Vec::new(),
+        stats: Stats::default(),
+        notes: Vec::new(),
+        withheld: Vec::new(),
+    };
+
+    match strategy {
+        Strategy::Unmodelled => {
+            out.notes
+                .push("UNAPPLIED: lines here are not modelled; nothing is patched".to_string());
+        }
+        Strategy::Singleton => diff_singleton(path, a, b, opts, &mut out),
+        Strategy::Keyed => diff_keyed(path, a, b, opts, &mut out),
+        Strategy::CommentKeyed => diff_comment_keyed(path, a, b, opts, &mut out),
+        Strategy::Positional => diff_positional(path, a, b, opts, &mut out),
+    }
+
+    // A line the model could not interpret is kept verbatim. In the *target*
+    // that means a configuration line this patch will not apply -- a
+    // selector-less `set` in a menu of objects, a `remove` or `move` a script
+    // carries, anything the parser does not model. Saying so is what lets the
+    // caller refuse instead of reporting a deploy that only half happened; a
+    // line like that on the *live* side is not a problem (nothing to apply).
+    let unmodelled = b.map(|s| s.extras.len()).unwrap_or(0);
+    if unmodelled > 0 {
+        out.notes.push(format!(
+            "UNAPPLIED: {unmodelled} line(s) in this menu are kept verbatim (a selector-less `set` \
+             in a menu of objects, or a command the model does not interpret), and nothing here \
+             is patched for them"
+        ));
+    }
+
+    if opts.removals == Removals::Withhold {
+        withhold_removals(&mut out);
+    }
+
+    out
+}
+
+/// Take the destructive half out of a section's plan.
+///
+/// An upsert may not delete, and what that costs is more than the `remove`
+/// lines:
+///
+/// * a **replacement** is a remove plus an add, so keeping half of it adds a
+///   second object beside the one it meant to replace;
+/// * a **positional section**'s adds are only correct once its removes have run
+///   (the rebuild is one operation: the same length in the target's order), so
+///   a rebuild the patch may not perform is left alone whole — otherwise every
+///   deploy appends another copy of the target's rules;
+/// * a **move** restores an order computed against a list the removes would
+///   have shortened, so it is withheld with them.
+///
+/// Everything else — adds of new objects, sets, singleton sets — is kept, which
+/// is what makes the result an upsert rather than a no-op.
+fn withhold_removals(out: &mut SectionDiff) {
+    if !out.ops.iter().any(|op| matches!(op, Op::Remove { .. })) {
+        return;
+    }
+    let rebuild = out.strategy == Strategy::Positional;
+    let mut kept = Vec::with_capacity(out.ops.len());
+    for op in std::mem::take(&mut out.ops) {
+        let drop = match &op {
+            Op::Remove { .. } | Op::Move { .. } => true,
+            Op::Add {
+                reason: AddReason::Replaced,
+                ..
+            } => true,
+            Op::Add { .. } if rebuild => true,
+            _ => false,
+        };
+        if drop {
+            out.withheld.push(op);
+        } else {
+            kept.push(op);
+        }
+    }
+    out.ops = kept;
+    // Recounted from what is left rather than decremented: a replacement's
+    // remove is counted as `replaced`, not as `removed`, so per-kind arithmetic
+    // on the way out would have to know which remove it was looking at.
+    let stats = stats_of(&out.ops);
+    out.stats = Stats {
+        withheld: out.withheld.len(),
+        ..stats
+    };
+
+    let whole_section = out.strategy == Strategy::Positional
+        && out
+            .withheld
+            .iter()
+            .any(|op| matches!(op, Op::Add { reason: AddReason::New, .. }));
+    let replaces = out
+        .withheld
+        .iter()
+        .filter(|op| matches!(op, Op::Add { reason: AddReason::Replaced, .. }))
+        .count();
+    let removes = out
+        .withheld
+        .iter()
+        .filter(|op| matches!(op, Op::Remove { .. }))
+        .count();
+    out.notes.push(if whole_section {
+        format!(
+            "UNAPPLIED: this menu has no stable handle, so reaching the target means \
+             rebuilding it -- {removes} removal(s) withheld, and the device keeps its own \
+             objects here"
+        )
+    } else if replaces > 0 {
+        format!(
+            "UNAPPLIED: {replaces} object(s) not re-created: a property has to disappear and \
+             RouterOS cannot unset one, so the operation is a remove plus an add -- both \
+             withheld; {removes} removal(s) withheld"
+        )
+    } else {
+        format!("{removes} removal(s) withheld: the device keeps what the target does not declare")
+    });
+}
+
+fn empty_section(path: &str) -> Section {
+    Section {
+        path: path.to_string(),
+        kind: SectionKind::Objects,
+        objects: Vec::new(),
+        extras: Vec::new(),
+    }
+}
+
+fn diff_singleton(
+    path: &str,
+    a: Option<&Section>,
+    b: Option<&Section>,
+    opts: &Options,
+    out: &mut SectionDiff,
+) {
+    let empty = empty_section(path);
+    let a = a.unwrap_or(&empty);
+    let b = b.unwrap_or(&empty);
+    let aobj = a.object(&Selector::Singleton);
+    let bobj = b.object(&Selector::Singleton);
+
+    let (changed, removed) = compare(aobj, bobj, path, opts);
+    if !changed.is_empty() {
+        let assertion = only_absent(&changed, aobj);
+        out.ops.push(Op::SingletonSet {
+            section: path.to_string(),
+            changes: changed.clone(),
+            assertion,
+        });
+        out.stats.changed += changed.len();
+    }
+    for key in removed {
+        out.ops.push(Op::Unresolvable {
+            section: path.to_string(),
+            selector: Selector::Singleton,
+            prop: key,
+        });
+        out.stats.unresolvable += 1;
+    }
+}
+
+fn diff_keyed(
+    path: &str,
+    a: Option<&Section>,
+    b: Option<&Section>,
+    opts: &Options,
+    out: &mut SectionDiff,
+) {
+    let empty = empty_section(path);
+    let a = a.unwrap_or(&empty);
+    let b = b.unwrap_or(&empty);
+
+    let mut adds = Vec::new();
+    let mut replaces = Vec::new();
+    let mut removes = Vec::new();
+
+    for obj_b in &b.objects {
+        match a.object(&obj_b.selector) {
+            None => {
+                // A `set`-origin object is a device default the source only
+                // mentions: `set telnet disabled=yes` on a router that has
+                // never listed it still works, and is a silent no-op if it
+                // does not exist. Copying it with `add` would invent an object.
+                if obj_b.origin == Origin::Set {
+                    out.stats.changed += obj_b.props.len();
+                    // The object is a device default the source only mentions:
+                    // nothing about it is in the live model, so this is an
+                    // assertion by definition.
+                    out.ops.push(Op::Set {
+                        section: path.to_string(),
+                        selector: obj_b.selector.clone(),
+                        changes: obj_b.props.clone(),
+                        assertion: true,
+                    });
+                } else {
+                    adds.push(Op::Add {
+                        section: path.to_string(),
+                        props: obj_b.props.clone(),
+                        place_before: None,
+                        reason: AddReason::New,
+                    });
+                    out.stats.added += 1;
+                }
+            }
+            Some(obj_a) => {
+                let (changed, removed) = property_changes(path, Some(obj_a), Some(obj_b), opts);
+                if !removed.is_empty() {
+                    // A property has to disappear and RouterOS cannot unset
+                    // one, so the object is removed and re-created from the
+                    // target's own text: that is exact by construction. The
+                    // remove comes first because `add name=x` on an existing
+                    // x is refused.
+                    if selector_hits(&obj_a.selector, &a.objects) > 1 {
+                        // The selector also addresses a neighbour, so this
+                        // removal would take both. Nothing here can address the
+                        // object on its own.
+                        out.notes.push(format!(
+                            "UNAPPLIED: {} cannot be re-created -- its selector also addresses \
+                             another object in this menu, so the removal would delete both",
+                            obj_a.selector
+                        ));
+                        continue;
+                    }
+                    replaces.push((
+                        index_of(&obj_a.selector),
+                        vec![
+                            Op::Remove {
+                                section: path.to_string(),
+                                selector: obj_a.selector.clone(),
+                                exact: !obj_a.selector.is_positional(),
+                            },
+                            Op::Add {
+                                section: path.to_string(),
+                                props: obj_b.props.clone(),
+                                place_before: if obj_a.selector.is_positional() {
+                                    // Re-created where it was, so the indices
+                                    // of the objects below it stay valid.
+                                    Some(obj_a.selector.clone())
+                                } else {
+                                    None
+                                },
+                                reason: AddReason::Replaced,
+                            },
+                        ],
+                    ));
+                    out.stats.replaced += 1;
+                } else if !changed.is_empty() {
+                    out.stats.changed += changed.len();
+                    let assertion = only_absent(&changed, Some(obj_a));
+                    out.ops.push(Op::Set {
+                        section: path.to_string(),
+                        selector: obj_a.selector.clone(),
+                        changes: changed,
+                        assertion,
+                    });
+                }
+            }
+        }
+    }
+
+    for obj_a in &a.objects {
+        if b.object(&obj_a.selector).is_none() {
+            if selector_hits(&obj_a.selector, &a.objects) > 1 {
+                out.notes.push(format!(
+                    "UNAPPLIED: {} cannot be removed -- its selector also addresses another \
+                     object in this menu, so the removal would delete both",
+                    obj_a.selector
+                ));
+                continue;
+            }
+            removes.push((
+                index_of(&obj_a.selector),
+                vec![Op::Remove {
+                    section: path.to_string(),
+                    selector: obj_a.selector.clone(),
+                    exact: !obj_a.selector.is_positional(),
+                }],
+            ));
+            out.stats.removed += 1;
+        }
+    }
+
+    // Adds and replacements before removals: a stale object alive for one more
+    // command is harmless, a missing one is not.
+    out.ops.extend(adds);
+
+    // Then the removals, positional ones first and from the end of the list:
+    // an index is only the one the source file described while nothing below it
+    // has moved, so a `remove 1` followed by `remove 2` deletes the wrong
+    // objects. Find-based removals do not care and go afterwards.
+    let mut tail: Vec<(Option<usize>, Vec<Op>)> = replaces;
+    tail.extend(removes);
+    tail.sort_by_key(|(idx, _)| match idx {
+        Some(i) => (0u8, std::cmp::Reverse(*i)),
+        None => (1u8, std::cmp::Reverse(0usize)),
+    });
+    for (_, ops) in tail {
+        out.ops.extend(ops);
+    }
+}
+
+/// Recount a section's operations by kind.
+///
+/// The incremental counters in the strategies answer "how much changed" while
+/// they build the plan; this answers the same question for a plan that has been
+/// filtered, and the two have to agree, so the rules are spelled once here.
+fn stats_of(ops: &[Op]) -> Stats {
+    let mut stats = Stats::default();
+    for op in ops {
+        if op.is_assertion() {
+            stats.asserted += 1;
+        }
+        match op {
+            Op::Add {
+                reason: AddReason::New,
+                ..
+            } => stats.added += 1,
+            Op::Add {
+                reason: AddReason::Replaced,
+                ..
+            } => stats.replaced += 1,
+            Op::Set { changes, .. } | Op::SingletonSet { changes, .. } => {
+                stats.changed += changes.len()
+            }
+            Op::Remove { .. } => stats.removed += 1,
+            Op::Move { .. } => stats.moved += 1,
+            Op::Unresolvable { .. } => stats.unresolvable += 1,
+        }
+    }
+    stats
+}
+
+/// The index a positional selector addresses.
+fn index_of(sel: &Selector) -> Option<usize> {
+    match sel {
+        Selector::Index(i) => Some(*i),
+        _ => None,
+    }
+}
+
+fn diff_comment_keyed(
+    path: &str,
+    a: Option<&Section>,
+    b: Option<&Section>,
+    opts: &Options,
+    out: &mut SectionDiff,
+) {
+    let empty = empty_section(path);
+    let a = a.unwrap_or(&empty);
+    let b = b.unwrap_or(&empty);
+
+    let comment = |s: &Section, o: &Object| s.comment_of(o).unwrap_or_default();
+    let akeys: Vec<String> = a.objects.iter().map(|o| comment(a, o)).collect();
+    let bkeys: Vec<String> = b.objects.iter().map(|o| comment(b, o)).collect();
+    let bset: HashSet<String> = bkeys.iter().cloned().collect();
+
+    // Objects whose property set shrinks have to be re-created.
+    let mut replace: HashSet<String> = HashSet::new();
+    let mut sets = Vec::new();
+    for (i, obj_b) in b.objects.iter().enumerate() {
+        let key = &bkeys[i];
+        if let Some(obj_a) = a.objects.iter().find(|o| comment(a, o) == *key) {
+            let (changed, removed) = property_changes(path, Some(obj_a), Some(obj_b), opts);
+            if !removed.is_empty() {
+                replace.insert(key.clone());
+            } else if !changed.is_empty() {
+                out.stats.changed += changed.len();
+                let assertion = only_absent(&changed, Some(obj_a));
+                sets.push(Op::Set {
+                    section: path.to_string(),
+                    selector: Selector::Comment(key.clone()),
+                    changes: changed,
+                    assertion,
+                });
+            }
+        }
+    }
+
+    // A key that exists for the whole patch and may therefore be anchored to.
+    let mut stable: HashSet<String> = akeys
+        .iter()
+        .filter(|k| bset.contains(*k) && !replace.contains(*k))
+        .cloned()
+        .collect();
+    // The list as the device will see it while the ops run.
+    let mut present: Vec<String> = akeys.clone();
+
+    let place =
+        |key: &str, present: &mut Vec<String>, stable: &mut HashSet<String>, from: usize| {
+            let anchor = bkeys[from + 1..]
+                .iter()
+                .find(|k| stable.contains(*k))
+                .cloned();
+            present.retain(|k| k != key);
+            match anchor
+                .as_ref()
+                .and_then(|anc| present.iter().position(|k| k == anc))
+            {
+                Some(pos) => present.insert(pos, key.to_string()),
+                None => present.push(key.to_string()),
+            }
+            stable.insert(key.to_string());
+            anchor
+        };
+
+    let mut replacements = Vec::new();
+    for (i, obj_b) in b.objects.iter().enumerate() {
+        let key = &bkeys[i];
+        if !replace.contains(key) {
+            continue;
+        }
+        // Remove first: `remove [find comment=x]` matches every rule carrying
+        // that comment, so leaving the old one in place while the new one is
+        // added would delete both.
+        replacements.push(Op::Remove {
+            section: path.to_string(),
+            selector: Selector::Comment(key.clone()),
+            exact: true,
+        });
+        present.retain(|k| k != key);
+        let anchor = place(key, &mut present, &mut stable, i);
+        replacements.push(Op::Add {
+            section: path.to_string(),
+            props: obj_b.props.clone(),
+            place_before: anchor.map(Selector::Comment),
+            reason: AddReason::Replaced,
+        });
+        out.stats.replaced += 1;
+    }
+
+    let mut adds = Vec::new();
+    for (i, obj_b) in b.objects.iter().enumerate() {
+        let key = &bkeys[i];
+        if replace.contains(key) || akeys.contains(key) {
+            continue;
+        }
+        if obj_b.origin == Origin::Set {
+            out.stats.changed += obj_b.props.len();
+            sets.push(Op::Set {
+                section: path.to_string(),
+                selector: Selector::Comment(key.clone()),
+                changes: obj_b.props.clone(),
+                assertion: true,
+            });
+            continue;
+        }
+        let anchor = place(key, &mut present, &mut stable, i);
+        adds.push(Op::Add {
+            section: path.to_string(),
+            props: obj_b.props.clone(),
+            place_before: anchor.map(Selector::Comment),
+            reason: AddReason::New,
+        });
+        out.stats.added += 1;
+    }
+
+    let mut removes = Vec::new();
+    for obj_a in &a.objects {
+        let key = comment(a, obj_a);
+        if bset.contains(&key) {
+            continue;
+        }
+        removes.push(Op::Remove {
+            section: path.to_string(),
+            selector: Selector::Comment(key.clone()),
+            exact: true,
+        });
+        out.stats.removed += 1;
+        present.retain(|k| *k != key);
+    }
+
+    // Order: what the target declares, reached by moving objects that already
+    // exist. The positions are those the device has after the adds and removes
+    // above, which is exactly what the moves will see.
+    let mut moves = Vec::new();
+    for i in 0..bkeys.len() {
+        if present.get(i) == Some(&bkeys[i]) {
+            continue;
+        }
+        let Some(j) = present.iter().position(|k| *k == bkeys[i]) else {
+            continue;
+        };
+        if j <= i {
+            continue;
+        }
+        moves.push(Op::Move {
+            section: path.to_string(),
+            selector: Selector::Comment(bkeys[i].clone()),
+            to: i,
+        });
+        out.stats.moved += 1;
+        let key = present.remove(j);
+        present.insert(i, key);
+    }
+
+    out.ops.extend(sets);
+    out.ops.extend(replacements);
+    out.ops.extend(adds);
+    out.ops.extend(removes);
+    out.ops.extend(moves);
+}
+
+fn diff_positional(
+    path: &str,
+    a: Option<&Section>,
+    b: Option<&Section>,
+    opts: &Options,
+    out: &mut SectionDiff,
+) {
+    let empty = empty_section(path);
+    let a = a.unwrap_or(&empty);
+    let b = b.unwrap_or(&empty);
+
+    // Same length: each rule still sits where it did, so the change is a `set`
+    // at that position — what a human would type, and nothing is recreated.
+    // RouterOS takes `place-before` as an index too, so a rule whose property
+    // set shrinks can be replaced in place rather than moved to the end.
+    if a.objects.len() == b.objects.len() {
+        for i in 0..b.objects.len() {
+            let obj_a = &a.objects[i];
+            let obj_b = &b.objects[i];
+            let (changed, removed) = property_changes(path, Some(obj_a), Some(obj_b), opts);
+            if !removed.is_empty() {
+                out.ops.push(Op::Remove {
+                    section: path.to_string(),
+                    selector: Selector::Index(i),
+                    exact: false,
+                });
+                out.ops.push(Op::Add {
+                    section: path.to_string(),
+                    props: obj_b.props.clone(),
+                    place_before: Some(Selector::Index(i)),
+                    reason: AddReason::Replaced,
+                });
+                out.stats.replaced += 1;
+            } else if !changed.is_empty() {
+                out.stats.changed += changed.len();
+                let assertion = only_absent(&changed, Some(obj_a));
+                out.ops.push(Op::Set {
+                    section: path.to_string(),
+                    selector: Selector::Index(i),
+                    changes: changed,
+                    assertion,
+                });
+            }
+        }
+        return;
+    }
+
+    // Different length: nothing in the text can address rule 3 of five, so the
+    // section is removed and rebuilt in the target's order.
+    for i in (0..a.objects.len()).rev() {
+        out.ops.push(Op::Remove {
+            section: path.to_string(),
+            selector: Selector::Index(i),
+            exact: false,
+        });
+        out.stats.removed += 1;
+    }
+    for obj_b in &b.objects {
+        out.ops.push(Op::Add {
+            section: path.to_string(),
+            props: obj_b.props.clone(),
+            place_before: None,
+            reason: AddReason::New,
+        });
+        out.stats.added += 1;
+    }
+    if !a.objects.is_empty() {
+        out.notes.push(
+            "no stable handle in this menu, so the section is rebuilt: exact, but every object \
+             is re-created"
+                .to_string(),
+        );
+    }
+}
+
+/// Compare two objects: the properties to set, and the keys that have to
+/// disappear.
+fn compare(
+    a: Option<&Object>,
+    b: Option<&Object>,
+    menu: &str,
+    opts: &Options,
+) -> (Vec<Prop>, Vec<String>) {
+    let empty: Vec<Prop> = Vec::new();
+    let ap = a.map(|o| &o.props).unwrap_or(&empty);
+    let bp = b.map(|o| &o.props).unwrap_or(&empty);
+
+    let mut changed = Vec::new();
+    for p in bp {
+        match ap.iter().find(|q| q.key == p.key) {
+            Some(q) if q.value.text == p.value.text => {}
+            _ => changed.push(p.clone()),
+        }
+    }
+
+    let mut removed = Vec::new();
+    for q in ap {
+        if bp.iter().any(|p| p.key == q.key) {
+            continue;
+        }
+        if opts.ignore_derived && is_derived(menu, &q.key) {
+            continue;
+        }
+        removed.push(q.key.clone());
+    }
+
+    (changed, removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse_config;
+
+    fn d(a: &str, b: &str) -> Diff {
+        diff(
+            &parse_config(a).unwrap(),
+            &parse_config(b).unwrap(),
+            &Options::default(),
+        )
+    }
+
+    #[test]
+    fn an_identical_config_has_no_operations() {
+        let src = "/ip pool\nadd name=lan ranges=10.0.0.10-10.0.0.20\n";
+        let diff = d(src, src);
+        assert!(diff.is_empty(), "{:?}", diff);
+        assert!(diff.is_exact());
+    }
+
+    #[test]
+    fn a_new_object_is_an_add() {
+        let diff = d(
+            "/ip pool\nadd name=lan ranges=10.0.0.10-10.0.0.20\n",
+            "/ip pool\nadd name=lan ranges=10.0.0.10-10.0.0.20\nadd name=wan ranges=10.1.0.10-10.1.0.20\n",
+        );
+        let stats = diff.stats();
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.removed, 0);
+    }
+
+    /// A write of a property the live object does not carry is an *assertion*:
+    /// `/export` never shows a WireGuard private key, and it omits a property
+    /// stated at its default, so a diff cannot confirm either one. Counting
+    /// those as changes is what made a converged device report "2 set" forever.
+    #[test]
+    fn a_property_the_export_cannot_show_is_an_assertion() {
+        let diff = d(
+            "/interface wireguard\nadd name=wg0 listen-port=51820\n",
+            "/interface wireguard\nadd name=wg0 listen-port=51820 private-key=\"AAAA=\"\n",
+        );
+        assert_eq!(diff.stats().asserted, 1, "{:?}", diff.stats());
+        assert!(diff.is_assertion_only(), "{:?}", diff.sections);
+        // The command a device is given is still `set` -- `assert` is what the
+        // report calls it. The patch header says how many there are.
+        let text = crate::patch::render(&diff, &crate::patch::RenderOptions::new("a", "b"));
+        assert!(text.contains("# assert: 1 operation(s)"), "{}", text);
+        assert!(text.contains("set [find name=wg0] private-key="), "{}", text);
+        assert!(diff.sections[0].ops[0].describe().starts_with("assert "));
+    }
+
+    /// ... and a property that *is* exported, holding another value, is a change
+    /// -- even when it shares a `set` with an assertion.
+    #[test]
+    fn a_real_change_is_not_an_assertion() {
+        let diff = d(
+            "/interface wireguard\nadd name=wg0 listen-port=51820\n",
+            "/interface wireguard\nadd name=wg0 listen-port=51821\n",
+        );
+        assert_eq!(diff.stats().asserted, 0, "{:?}", diff.stats());
+        assert!(!diff.is_assertion_only());
+
+        // One `set` carrying both: the op writes something the device can show,
+        // so the op is a change and only the assertion's property is counted.
+        let mixed = d(
+            "/interface wireguard\nadd name=wg0 listen-port=51820\n",
+            "/interface wireguard\nadd name=wg0 listen-port=51821 private-key=\"AAAA=\"\n",
+        );
+        assert_eq!(mixed.stats().asserted, 0, "{:?}", mixed.stats());
+        assert!(!mixed.is_assertion_only());
+    }
+
+    /// Anything the device can act on -- an add, a remove, a withheld removal --
+    /// means the plan is not merely re-asserting, whatever else is in it.
+    #[test]
+    fn only_a_plan_of_assertions_is_converged() {
+        let opts = Options::default();
+        let add = d("/ip pool\n", "/ip pool\nadd name=a ranges=1\n");
+        assert!(!add.is_assertion_only());
+
+        // A withheld *removal* is still converged: the plan applies everything
+        // it can, and the extra object is reported as withheld.
+        let withheld = diff(
+            &parse_config("/ip pool\nadd name=a ranges=1\n").unwrap(),
+            &parse_config("/ip pool\n").unwrap(),
+            &Options {
+                removals: Removals::Withhold,
+                ..Options::default()
+            },
+        );
+        assert!(withheld.is_assertion_only(), "{:?}", withheld.sections);
+
+        // A withheld *rebuild* is not: the target's rules are missing from the
+        // device, and no later run would add them.
+        let rebuild = diff(
+            &parse_config(
+                "/ip firewall filter\nadd chain=input action=accept\nadd chain=input action=drop\n",
+            )
+            .unwrap(),
+            &parse_config("/ip firewall filter\nadd chain=input action=accept protocol=icmp\n")
+                .unwrap(),
+            &Options {
+                removals: Removals::Withhold,
+                ..Options::default()
+            },
+        );
+        assert!(!rebuild.is_assertion_only(), "{:?}", rebuild.sections);
+
+        // A property the target drops and RouterOS cannot unset is not
+        // something a deploy can fix, so it does not make the plan "differ".
+        let unresolvable = d("/system note\nset show-at-login=no\n", "");
+        assert_eq!(unresolvable.stats().unresolvable, 1, "{:?}", unresolvable.stats());
+        assert!(unresolvable.is_assertion_only(), "{:?}", unresolvable.sections);
+
+        let empty = d("/ip pool\n", "/ip pool\n");
+        assert!(empty.is_assertion_only());
+        let _ = opts;
+    }
+
+    /// A target line the model cannot address is reported, not guessed at: the
+    /// caller refuses a plan containing `UNAPPLIED:`, so a deploy can never
+    /// report success for a line it did not apply.
+    #[test]
+    fn a_target_line_that_cannot_be_addressed_is_unapplied() {
+        let diff = d(
+            "/ip pool\nadd name=a ranges=1\n",
+            "/ip pool\nadd name=a ranges=2\nset comment=x\n",
+        );
+        assert!(
+            diff.sections[0].notes.iter().any(|n| n.starts_with("UNAPPLIED:")),
+            "{:?}",
+            diff.sections[0].notes
+        );
+        let text = crate::patch::render(&diff, &crate::patch::RenderOptions::new("a", "b"));
+        assert!(!text.lines().any(|l| l.trim() == "remove"), "{}", text);
+
+        // A command before the first menu is the same story.
+        let preamble = d("/ip pool\nadd name=a ranges=1\n", ":log info \"x\"\n");
+        assert!(
+            preamble.notes.iter().any(|n| n.starts_with("UNAPPLIED:")),
+            "{:?}",
+            preamble.notes
+        );
+    }
+
+    /// A composite key is built from the parts an object carries, so an object
+    /// missing one part has a selector its neighbour also satisfies. A removal
+    /// with that selector would delete both while the patch said one -- measured
+    /// shape: `/interface bridge port` keyed on `bridge`+`interface`, with one
+    /// port object that has no `interface`.
+    #[test]
+    fn a_selector_that_would_take_two_objects_is_refused() {
+        let diff = d(
+            "/interface bridge port\nadd bridge=br interface=ether1\nadd bridge=br\n",
+            "/interface bridge port\nadd bridge=br interface=ether1\n",
+        );
+        let section = &diff.sections[0];
+        assert!(section.ops.is_empty(), "{:?}", section.ops);
+        assert!(
+            section
+                .notes
+                .iter()
+                .any(|n| n.starts_with("UNAPPLIED:") && n.contains("delete both")),
+            "{:?}",
+            section.notes
+        );
+
+        // The control: with the missing part present, the same removal is a
+        // find that names one object, and it is emitted.
+        let unique = d(
+            "/interface bridge port\nadd bridge=br interface=ether1\nadd bridge=br interface=ether2\n",
+            "/interface bridge port\nadd bridge=br interface=ether1\n",
+        );
+        assert_eq!(unique.sections[0].ops.len(), 1, "{:?}", unique.sections[0].ops);
+        assert!(unique.sections[0].notes.iter().all(|n| !n.starts_with("UNAPPLIED:")));
+    }
+
+    #[test]
+    fn a_changed_value_is_a_set() {
+        let diff = d(
+            "/ip pool\nadd name=lan ranges=10.0.0.10-10.0.0.20\n",
+            "/ip pool\nadd name=lan ranges=10.0.0.30-10.0.0.40\n",
+        );
+        let ops = &diff.sections[0].ops;
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], Op::Set { .. }), "{:?}", ops[0]);
+    }
+
+    #[test]
+    fn a_dropped_property_forces_a_replacement() {
+        let diff = d(
+            "/interface wireguard\nadd listen-port=51820 mtu=1420 name=wg0\n",
+            "/interface wireguard\nadd listen-port=51820 name=wg0\n",
+        );
+        let stats = diff.stats();
+        assert_eq!(stats.replaced, 1, "{:?}", diff.sections[0]);
+        assert!(diff.sections[0].ops.iter().any(|o| matches!(
+            o,
+            Op::Add {
+                reason: AddReason::Replaced,
+                ..
+            }
+        )));
+    }
+
+    /// `comment=""` is the one property measured to reset in place, so a
+    /// dropped comment must not cost a re-create.
+    #[test]
+    fn a_dropped_comment_is_cleared_not_replaced() {
+        let diff = d(
+            "/ip pool\nadd name=lan ranges=1 comment=old\n",
+            "/ip pool\nadd name=lan ranges=1\n",
+        );
+        let s = &diff.sections[0];
+        assert_eq!(s.stats.replaced, 0, "{:?}", s.ops);
+        assert_eq!(s.ops.len(), 1, "{:?}", s.ops);
+        let Op::Set { changes, .. } = &s.ops[0] else {
+            panic!("expected a set, got {:?}", s.ops[0])
+        };
+        assert_eq!(changes[0].raw, "comment=\"\"");
+    }
+
+    #[test]
+    fn an_object_missing_from_the_target_is_removed() {
+        let diff = d(
+            "/ip pool\nadd name=lan ranges=1\nadd name=wan ranges=2\n",
+            "/ip pool\nadd name=lan ranges=1\n",
+        );
+        assert_eq!(diff.stats().removed, 1);
+    }
+
+    #[test]
+    fn a_derived_property_is_not_a_difference() {
+        let diff = d(
+            "/ip address\nadd address=10.0.0.1/24 interface=ether1 network=10.0.0.0\n",
+            "/ip address\nadd address=10.0.0.1/24 interface=ether1\n",
+        );
+        assert!(diff.is_empty(), "{:?}", diff.sections[0]);
+    }
+
+    #[test]
+    fn an_ordered_menu_with_comments_is_keyed_by_comment() {
+        let diff = d(
+            "/ip firewall filter\nadd chain=input action=accept comment=a\nadd chain=input action=drop comment=b\n",
+            "/ip firewall filter\nadd chain=input action=accept comment=a\nadd chain=input action=accept comment=c\n",
+        );
+        let s = &diff.sections[0];
+        assert_eq!(s.strategy, Strategy::CommentKeyed);
+        let stats = &s.stats;
+        assert_eq!((stats.added, stats.removed), (1, 1));
+        // The new rule is anchored before nothing (b was last) and appended.
+        assert!(s.ops.iter().any(|o| matches!(o, Op::Add { .. })));
+    }
+
+    #[test]
+    fn an_ordered_menu_without_comments_is_set_by_position() {
+        let diff = d(
+            "/ip firewall filter\nadd chain=input action=accept\nadd chain=input action=drop\n",
+            "/ip firewall filter\nadd chain=input action=accept\nadd chain=input action=accept protocol=icmp\n",
+        );
+        let s = &diff.sections[0];
+        assert_eq!(s.strategy, Strategy::Positional);
+        assert_eq!(s.stats.changed, 2, "{:?}", s.ops);
+        assert_eq!(s.stats.added + s.stats.removed, 0, "{:?}", s.ops);
+        // Addressing by position is not exact: it assumes the device's list is
+        // the one the source describes.
+        assert!(!diff.is_exact());
+    }
+
+    #[test]
+    fn a_longer_ordered_menu_is_rebuilt() {
+        let diff = d(
+            "/ip firewall filter\nadd chain=input action=accept\nadd chain=input action=drop\n",
+            "/ip firewall filter\nadd chain=input action=accept\nadd chain=input action=accept protocol=icmp\nadd chain=input action=drop\n",
+        );
+        let s = &diff.sections[0];
+        assert_eq!(s.strategy, Strategy::Positional);
+        assert_eq!((s.stats.removed, s.stats.added), (2, 3), "{:?}", s.ops);
+        assert!(!diff.is_exact());
+    }
+
+    #[test]
+    fn a_reordered_ordered_menu_emits_a_move() {
+        let diff = d(
+            "/ip firewall filter\nadd chain=input action=accept comment=a\nadd chain=input action=accept comment=b\n",
+            "/ip firewall filter\nadd chain=input action=accept comment=b\nadd chain=input action=accept comment=a\n",
+        );
+        let s = &diff.sections[0];
+        assert_eq!(s.stats.moved, 1, "{:?}", s.ops);
+    }
+
+    #[test]
+    fn a_singleton_property_that_disappears_is_reported_not_patched() {
+        let diff = d(
+            "/ip dns\nset servers=1.1.1.1 allow-remote-requests=yes\n",
+            "/ip dns\nset servers=1.1.1.1\n",
+        );
+        let s = &diff.sections[0];
+        assert_eq!(s.strategy, Strategy::Singleton);
+        assert_eq!(s.stats.unresolvable, 1);
+        assert!(!diff.is_exact());
+    }
+
+    #[test]
+    fn an_address_on_another_interface_is_a_different_object() {
+        let diff = d(
+            "/ip address\nadd address=10.0.0.1/24 interface=ether1\n",
+            "/ip address\nadd address=10.0.0.1/24 interface=ether2\n",
+        );
+        let stats = diff.stats();
+        assert_eq!((stats.added, stats.removed), (1, 1));
+    }
+}

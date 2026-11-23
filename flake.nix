@@ -132,7 +132,14 @@
                 (mt.mkRouterScript { inherit pkgs name; config = cfg; }))
             evaluated
           // {
-            nix-mikrotik = pkgs.callPackage ./pkgs/nix-mikrotik.nix { };
+            nix-mikrotik = pkgs.callPackage ./pkgs/nix-mikrotik.nix {
+              # The differ `deploy` drives, from this same flake: one pin, so
+              # the CLI and the crate cannot disagree about a patch.
+              rsc = config.packages.rsc;
+            };
+            # The `.rsc` parser, differ and patch generator. Its own test suite
+            # runs in the build, so `nix build .#rsc` is the check.
+            rsc = pkgs.callPackage ./pkgs/rsc.nix { };
             chr-lab = chr.lab;
             mikrotik-chr = chr.image;
             mikrotik-option = chr.optionPackage;
@@ -187,6 +194,11 @@
               type = "app";
               program = lib.getExe config.packages.nix-mikrotik;
               meta.description = "Build, secret-deliver and deploy RouterOS scripts";
+            };
+            rsc = {
+              type = "app";
+              program = lib.getExe config.packages.rsc;
+              meta.description = "Parse, diff and patch RouterOS .rsc scripts";
             };
             default = config.apps.chr-lab;
           };
@@ -302,6 +314,24 @@
               inherit pkgs;
               inherit (mt) evalMikrotik evalMikrotikFleet evalMikrotikFleetConfigs evalMikrotikRaw mkSecret generators;
             };
+
+            # The `.rsc` parser's own suite: the round trip over the renderer's
+            # goldens and a real 7.15.3 export, and the upsert property (applying
+            # the patch to the model of the first file yields the second). It
+            # runs in the package's check phase, so this check is that build.
+            rsc = config.packages.rsc;
+
+            # ... and the same property fuzzed: generated scripts from the menu
+            # table the device reports, every ordered pair through diff, patch,
+            # verify (both modes) and the JSON report. A fixed seed, so a failure
+            # is reproducible; `tests/fuzz-rsc.py` is the same tool by hand.
+            rsc-fuzz = pkgs.runCommand "check-rsc-fuzz" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+              cd ${./.}
+              python3 tests/fuzz-rsc.py ${config.packages.rsc}/bin/rsc \
+                --cases 200 --seed 1 --root ${./.} > "$out" 2>&1 || {
+                  cat "$out" >&2; exit 1; }
+              cat "$out"
+            '';
           };
 
           devShells.default = pkgs.mkShell {

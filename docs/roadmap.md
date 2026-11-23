@@ -3,18 +3,29 @@
 The gaps that are deliberate, what would close each, and the two that are
 measured on a device rather than assumed.
 
+The procedure for working on these, and the ordered backlog with a "done when"
+for each, is in [The hardening campaigns](hardening-campaigns.md).
+
 * **one RouterOS version, not two**: the menu table is walked from 7.25, while
   `chr/default.nix` pins 7.15.3 for the lab and `checks.chr-deploy`. A menu the
   fleet uses can therefore be in the table and absent from the device the
   checks deploy to, or the other way round. Bumping the pin to the version the
   table is walked from closes it; the licence and the deploy fixture need the
   same pass ([Maintaining the menu table](maintaining-the-menu-table.md)).
-* **a real diff/reconcile**: upstream's stated goal of a structural diff needs
-  a parser for `.rsc`, which does not exist here. `diff` is textual.
-* **idempotent import**: without reconciliation, `--reset` is the only
-  convergent mode, and it is destructive.
+* **a real diff/reconcile**: the parser and the differ exist
+  ([the `.rsc` parser](rsc-parser.md)) and `deploy` now applies the *difference*
+  between the device's `/export` and the script, so a second deploy converges
+  instead of duplicating ([Deploying](deploying.md)). What is still missing is
+  the **ownership predicate**: the patch knows what the device holds and what the
+  script declares, but not which of the device's objects this repository owns,
+  so deletions are withheld unless `--prune` says otherwise.
+* **idempotent import**: closed for the default path — `deploy` computes a patch
+  and a repeat is a plan of `set`s (measured: a second deploy of the CHR fixture
+  is `0 add, 2 set, 0 remove`, and the object handles do not change). The
+  whole-script path (`--import-whole`, and `--reset`) is still a one-shot.
 * **`/export`-based import of existing routers**: the migration path is still
-  "read the export, write the module by hand".
+  "read the export, write the module by hand". The differ reads an export, which
+  makes a *converge* of an existing router possible; it does not write the module.
 * **the examples on a CHR**: they describe a router with `ether2` … `ether5` and
   `sfp1`, and a stock CHR has one ethernet port, so an `/ip address …
   interface=ether2` line is refused at runtime (`script error: input does not

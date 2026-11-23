@@ -9,8 +9,18 @@ store:
   render      build a configuration's script through nix and copy it out
   list-secrets  list the placeholders a script still contains
   secretize   substitute real values into a private temporary copy
-  deploy      secretize, upload, import, verify, and remove the file again
-  diff        export the device's live config and diff it against the script
+  deploy      secretize, diff against the device, import the difference, verify
+  diff        export the device's live config and diff it textually against the script
+
+`deploy` applies the *difference* between the device's own `/export` and the
+script, computed by `rsc` (the crate in `rsc/`), rather than re-importing every
+line. That is what makes a second deploy safe: `/import` of `add` lines is not
+idempotent -- a repeated `add` makes a second object, and the device refuses the
+script from that point on -- while a patch that says `set [find name=…]` for an
+object that already exists converges. Deletions are withheld by default
+(`--prune` applies them): an `/export` carries the whole configuration, so
+"not in the target" includes the address the deploy itself is talking over.
+`--import-whole` keeps the old path, and `--check` prints the plan and stops.
 
 RouterOS cannot run sops-nix, so a secret cannot be "activated" onto the
 device the way it is onto a NixOS host. It is delivered here instead: the value
@@ -46,7 +56,16 @@ import sys
 import tempfile
 import time
 
-DEFAULT_SCRIPT_NAME = "router-config.rsc"
+# The prefix of the file a deploy uploads. The *name* is per run (see
+# `remote_name`): a fixed name meant two deploys to one device shared it, and
+# either one's cleanup could delete the other's file while its import was still
+# reading it.
+SCRIPT_NAME_PREFIX = "router-config"
+
+# The name the renderer writes inside its store path. A derivation's contents are
+# not shared between runs the way a device's flat file store is, so this one is
+# fixed -- and `--import-whole` uploads it under a per-run name all the same.
+RENDERED_SCRIPT_NAME = "router-config.rsc"
 
 # The name between the markers is also a file name in a secrets directory (see
 # README "Clan vars"), so it has to be one: a name carrying a path separator or
@@ -860,13 +879,20 @@ class Router:
 
     def __init__(self, host: str, user: str = "admin", port: int = 22,
                  key: str | None = None, known_hosts: str | None = None,
-                 timeout: int = 20) -> None:
+                 timeout: int = 20, command_timeout: int = 120) -> None:
         self.host = host
         self.user = user
         self.port = port
         self.key = key
         self.known_hosts = check_known_hosts(known_hosts) if known_hosts else None
         self.timeout = timeout
+        # A device that answers the TCP connection and then stops talking -- a
+        # wedged sshd, a script that blocks the console, a reboot in the middle
+        # of an import -- otherwise holds the caller open forever. A deploy that
+        # is a systemd unit has no terminal to interrupt it with, so the only
+        # way out is a timeout of our own; `ConnectTimeout` does not cover it
+        # because the connection is already established.
+        self.command_timeout = command_timeout
 
     def _common(self) -> list[str]:
         args = [
@@ -882,10 +908,19 @@ class Router:
             args += ["-o", f"UserKnownHostsFile={self.known_hosts}"]
         return args
 
-    def run(self, command: str) -> str:
+    def run(self, command: str, timeout: int | None = None) -> str:
         argv = ["ssh", *self._common(), "-p", str(self.port),
                 f"{self.user}@{self.host}", command]
-        proc = subprocess.run(argv, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=timeout or self.command_timeout)
+        except subprocess.TimeoutExpired:
+            raise ToolError(
+                f"the device did not answer within "
+                f"{timeout or self.command_timeout}s: {command}\n"
+                "the connection is open, so this is the device not finishing the "
+                "command (a script that blocks, a reboot, a wedged sshd), not a "
+                "refused connection -- check it on the console before re-running") from None
         if proc.returncode != 0:
             raise ToolError(
                 f"ssh command failed ({proc.returncode}): {command}\n"
@@ -898,7 +933,14 @@ class Router:
         # RouterOS speaks the legacy scp protocol only; current OpenSSH needs -O.
         argv = ["scp", "-O", *self._common(), "-P", str(self.port),
                 local, f"{self.user}@{self.host}:{remote}"]
-        proc = subprocess.run(argv, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=max(self.command_timeout, 300))
+        except subprocess.TimeoutExpired:
+            raise ToolError(
+                f"scp of {local} did not finish within "
+                f"{max(self.command_timeout, 300)}s -- the device's storage may be "
+                "full, or its sshd has stopped reading") from None
         if proc.returncode != 0:
             raise ToolError(f"scp failed ({proc.returncode}):\n{proc.stderr.strip()}")
         return remote
@@ -944,6 +986,20 @@ class Router:
         out = self.run('/log print where topics~"script"')
         return [line.strip() for line in out.splitlines() if "script,error" in line]
 
+    def script_files(self) -> list[str]:
+        """The uploaded scripts on the device, by name.
+
+        A name is a name: `/file print` prints an index, a name, a type and a
+        size, and only the `.rsc` entries are ours.
+        """
+        out = self.run(f'/file print where name~"^{SCRIPT_NAME_PREFIX}"')
+        names = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].endswith(".rsc"):
+                names.append(parts[1])
+        return names
+
     def export(self) -> str:
         return self.run("/export terse")
 
@@ -961,7 +1017,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     if out.returncode != 0:
         raise ToolError(f"nix build failed for {attr}:\n{out.stderr.strip()}")
     store_path = out.stdout.strip().splitlines()[-1]
-    source = os.path.join(store_path, DEFAULT_SCRIPT_NAME)
+    source = os.path.join(store_path, RENDERED_SCRIPT_NAME)
     if not os.path.isfile(source):
         raise ToolError(f"{source} does not exist in the build output")
     destination = args.output or f"{args.name}.rsc"
@@ -1131,7 +1187,6 @@ def new_sentinel() -> str:
     """A per-deploy marker, so an old log entry cannot be mistaken for this one."""
     return f"{SENTINEL_PREFIX}-{os.urandom(8).hex()}"
 
-
 def sentinel_line(marker: str) -> str:
     """The line appended to the uploaded copy, and why it is there.
 
@@ -1144,6 +1199,172 @@ def sentinel_line(marker: str) -> str:
     device, and the marker is unique per deploy.
     """
     return f'\n:log info "{marker}"\n'
+
+
+# --------------------------------------------------------------------------
+# the differ
+# --------------------------------------------------------------------------
+
+def remote_name(marker: str) -> str:
+    """The name a deploy gives its uploaded script: unique per run.
+
+    RouterOS keeps one flat file store, so a fixed `router-config.rsc` is shared
+    by every deploy to that device. Two runs then race: one removes the file
+    while the other's `/import` is reading it, and the failure looks like a
+    device error. The marker is the same random string the sentinel uses, so a
+    leftover can be tied to the run that left it.
+    """
+    return f"{SCRIPT_NAME_PREFIX}-{marker}.rsc"
+
+
+def stale_warning(names: list[str]) -> str | None:
+    """What to say about script files an interrupted run left behind.
+
+    Cleanup is a `finally`, so a deploy that is SIGKILLed (or whose host dies)
+    leaves the *secretized* script -- plaintext secrets -- on the device's flash.
+    Nothing sweeps them: deleting `router-config-*.rsc` would also delete the file
+    a concurrent run is importing. So the next run names them.
+    """
+    if not names:
+        return None
+    return ("warning: the device still holds script file(s) from an interrupted "
+            "deploy, which contain the secret values that were being delivered: "
+            + ", ".join(names)
+            + " -- remove them with `/file remove <name>` once nothing else is "
+              "importing them")
+
+
+def rsc_binary() -> str:
+    """The `rsc` differ this tool drives.
+
+    It ships beside `nix-mikrotik` in the same package (the flake wraps both into
+    one PATH), so the plain name is the normal case. `NIX_MIKROTIK_RSC` is for
+    the test harness, which runs the tool from a worktree against a binary it
+    just built rather than through the wrapper.
+    """
+    return os.environ.get("NIX_MIKROTIK_RSC") or "rsc"
+
+
+def run_rsc(argv: list[str], what: str) -> str:
+    """Run the differ, and turn its failures into this tool's own.
+
+    Exit 2 is a parse error on one of the two files: the device's `/export` is
+    the one that surprises a parser (a script block, a menu the model does not
+    know), and it is the file the operator cannot edit -- so the message names
+    the escape hatch instead of leaving a Rust diagnostic to read.
+    """
+    try:
+        proc = subprocess.run([rsc_binary(), *argv], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise ToolError(
+            f"`{rsc_binary()}` is not on PATH: it is the differ this deploy "
+            "computes its patch with, and it ships with nix-mikrotik -- run the "
+            "packaged tool rather than the script") from None
+    if proc.returncode == 2:
+        raise ToolError(
+            f"rsc could not parse a file while computing {what}:\n"
+            f"{proc.stderr.strip()}\n"
+            "if it is the device's /export, pass --import-whole: importing the "
+            "script is the path that does not read the device's configuration")
+    if proc.returncode != 0:
+        raise ToolError(f"rsc {argv[0]} failed ({proc.returncode}):\n{proc.stderr.strip()}")
+    return proc.stdout
+
+
+def patch_commands(text: str) -> list[str]:
+    """The lines of a patch a device would actually run.
+
+    A patch is mostly comments -- the header, the notes, and every operation
+    that was withheld -- and a file with none of them left is a deploy with
+    nothing to do. Counting them is also what keeps an empty patch off the
+    device: uploading and importing it would only prove the sentinel works.
+    """
+    commands = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("/"):
+            continue
+        if stripped.startswith(":"):
+            # `:log info "<sentinel>"` is a command, but it is this tool's own
+            # proof-of-run, not a change: a patch made only of one is empty.
+            continue
+        commands.append(stripped)
+    return commands
+
+
+def render_patch(router: "Router", text: str, workdir: str, prune: bool,
+                 marker: str) -> tuple[str, str]:
+    """Diff the device against `text` and return (patch, report).
+
+    The device is the source of "what is there now": a fresh `/export`, which is
+    the only statement about the device that does not go through this tool's own
+    record of what it thinks it deployed. The script is the target. The differ
+    turns the two into the console commands in between, and the sentinel it
+    appends is the same proof-of-run the whole-script path uses -- RouterOS
+    exits 0 for an import it refused, so the log line is the only positive
+    evidence that the patch ran to the end.
+
+    `prune` decides what happens to the operations that delete. Without it the
+    patch is an *upsert*: adds and sets only. That is not caution for its own
+    sake -- an `/export` carries the device's whole configuration, so "not in
+    the target" includes the address this deploy is talking to the device over,
+    the ethernet interfaces, and anything somebody added by hand. Deleting those
+    is what "exact" means, and it is not this tool's decision to make.
+    """
+    live_path = os.path.join(workdir, "live.rsc")
+    target_path = os.path.join(workdir, "target.rsc")
+    for path, content in ((live_path, router.export()), (target_path, text)):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+
+    mode = [] if prune else ["--upsert"]
+    report = run_rsc(["diff", live_path, target_path, *mode], "the difference")
+    patch = run_rsc(["patch", live_path, target_path, *mode, "--sentinel", marker],
+                    "the patch")
+    return patch, report
+
+
+def patch_summary(report: str) -> str:
+    """The one line of `rsc diff`'s report that says how much work there is."""
+    for line in report.splitlines():
+        if "operations:" in line:
+            return line.strip()
+    return "the differ reported no operations"
+
+
+def converged(report: str) -> bool:
+    """Did the differ find nothing the device can report would change?
+
+    `rsc diff` says `converged:` when every operation left is a write of a value
+    `/export` cannot show -- a WireGuard private key, a property stated at its
+    default. That is the honest answer to "is this device in the declared
+    state": the diff can never be empty for such a script, because the export it
+    compares against never carries those values, so counting operations would
+    make a drift check fail forever on a device that is correct.
+    """
+    return any(line.strip().startswith("converged:") for line in report.splitlines())
+
+
+def unapplied(report: str) -> list[str]:
+    """What the plan says it cannot apply, in the differ's own words.
+
+    `rsc` marks a section it could not express with `UNAPPLIED:` rather than
+    leaving a note among the others: a deploy that reports success while part of
+    the target was never applied is the one failure an operator cannot see, so
+    the line is greppable and this tool refuses on it by default.
+
+    Three shapes reach here, all measured: a target line the differ cannot model
+    (a block script, `extraScript`), a menu with no stable handle that would have
+    to be rebuilt (which is a removal), and an object whose re-creation needs a
+    property to disappear (RouterOS has no unset).
+    """
+    marker = "UNAPPLIED:"
+    found = []
+    for line in report.splitlines():
+        if marker in line:
+            found.append(line.split(marker, 1)[1].strip())
+    return found
 
 
 def import_failed(detail: str) -> str:
@@ -1212,8 +1433,21 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             "--reset wipes the device's configuration and reboots it; "
             "pass --yes to confirm")
 
-    router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
+    router = Router(args.host, args.user, args.port, args.key, args.known_hosts,
+                    command_timeout=args.command_timeout)
     text, names = _secretize(args.script, args.secret, args.secrets_dir, args.secret_command, args.sops_file, args.sops_key_file, args.secret_generator, args.generator_state_dir, args.generators, prompt_values(args), args.dry_run)
+
+    # An empty script is not a request to empty the device. A render that
+    # produced nothing is a broken configuration -- a module that evaluated to
+    # no sections, a flake output that changed shape -- and deploying it would
+    # either do nothing (with deletions withheld, which reads as success) or, on
+    # a device this tool owns, delete everything. Refuse, and say which.
+    if not [line for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")]:
+        raise ToolError(
+            "the script contains no commands: an empty render is a broken "
+            "configuration, not a request to empty the device. Check what "
+            "produced it before deploying")
 
     if args.dry_run:
         print(f"would deploy {len(text)} bytes with {len(names)} secret(s) to "
@@ -1228,10 +1462,85 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     remote = None
     marker = new_sentinel()
     try:
-        staged = os.path.join(workdir, DEFAULT_SCRIPT_NAME)
+        # Which script the device is given is the whole of this change. By
+        # default it is the *difference* between the device's own /export and
+        # the target, computed here and applied as a patch; `--import-whole`
+        # keeps the old path, which re-imports every line and is only correct on
+        # a device that is empty or already in that exact state.
+        whole = args.reset or args.import_whole
+        if whole:
+            body = text
+            summary = f"{len(text)} bytes, imported whole"
+        else:
+            patch, report = render_patch(router, text, workdir, args.prune, marker)
+            if args.check:
+                print(report, end="" if report.endswith("\n") else "\n")
+                print("check: nothing was sent to the device", file=sys.stderr)
+                gaps = unapplied(report)
+                if gaps:
+                    # A plan that cannot reach the target is not a converged
+                    # device, however few commands it emits.
+                    print("check: the plan cannot reach this configuration:",
+                          file=sys.stderr)
+                    for gap in gaps:
+                        print(f"  {gap}", file=sys.stderr)
+                    return 1
+                if converged(report):
+                    print("check: converged", file=sys.stderr)
+                    return 0
+                print("check: the device differs", file=sys.stderr)
+                return 1
+            gaps = unapplied(report)
+            if gaps and not args.allow_partial:
+                raise ToolError(
+                    "the plan cannot reach this configuration, and applying it "
+                    "anyway would report success for a device that is only "
+                    "partly configured:\n  "
+                    + "\n  ".join(gaps)
+                    + "\npass --allow-partial to apply what the differ can express "
+                      "and leave the rest as it is, or --prune where a deletion is "
+                      "what is missing, or --import-whole for lines the differ "
+                      "cannot model")
+            if gaps:
+                print("warning: applying a partial configuration; the differ cannot "
+                      "express:", file=sys.stderr)
+                for gap in gaps:
+                    print(f"  {gap}", file=sys.stderr)
+            commands = patch_commands(patch)
+            if not commands:
+                print("no changes: the device already holds this configuration",
+                      file=sys.stderr)
+                print(report, end="" if report.endswith("\n") else "\n",
+                      file=sys.stderr)
+                if args.verify:
+                    _verify_identity(router, args)
+                return 0
+            body = patch
+            summary = patch_summary(report)
+            print(f"{summary}", file=sys.stderr)
+            if converged(report):
+                print("the device already holds this configuration; the plan "
+                      "re-asserts only values /export cannot show",
+                      file=sys.stderr)
+            if not args.prune:
+                print("removals are withheld (upsert): pass --prune to apply "
+                      "the operations that delete", file=sys.stderr)
+
+        if args.check:
+            # Only the diff path can check without sending anything; the
+            # whole-script path has no plan to show.
+            raise ToolError("--check needs the diff path: do not combine it with "
+                            "--import-whole or --reset")
+
+        stale = stale_warning(router.script_files())
+        if stale:
+            print(stale, file=sys.stderr)
+        staged = os.path.join(workdir, remote_name(marker))
         fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text + sentinel_line(marker))
+            # The differ already appended the sentinel to a patch; the
+            # whole-script path has to add its own.
+            handle.write(body if whole is False else body + sentinel_line(marker))
 
         print(f"uploading to {args.user}@{args.host}:{args.port}", file=sys.stderr)
         remote = router.upload(staged)
@@ -1259,14 +1568,18 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         shutil.rmtree(workdir, ignore_errors=True)
 
     if args.verify:
-        identity = router.identity()
-        if identity is None:
-            raise ToolError("could not read /system identity after deploy")
-        if args.expect_hostname and identity != args.expect_hostname:
-            raise ToolError(
-                f"identity is '{identity}', expected '{args.expect_hostname}'")
-        print(f"verified: identity is '{identity}'")
+        _verify_identity(router, args)
     return 0
+
+
+def _verify_identity(router: Router, args: argparse.Namespace) -> None:
+    identity = router.identity()
+    if identity is None:
+        raise ToolError("could not read /system identity after deploy")
+    if args.expect_hostname and identity != args.expect_hostname:
+        raise ToolError(
+            f"identity is '{identity}', expected '{args.expect_hostname}'")
+    print(f"verified: identity is '{identity}'")
 
 
 def _wait_for_router(router: Router, timeout: int) -> None:
@@ -1295,7 +1608,8 @@ def _normalise(text: str) -> list[str]:
 def cmd_diff(args: argparse.Namespace) -> int:
     import difflib
 
-    router = Router(args.host, args.user, args.port, args.key, args.known_hosts)
+    router = Router(args.host, args.user, args.port, args.key, args.known_hosts,
+                    command_timeout=args.command_timeout)
     live = _normalise(router.export())
     with open(args.script, "r", encoding="utf-8") as handle:
         wanted = _normalise(handle.read())
@@ -1388,7 +1702,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_prompt_arguments(p)
     p.set_defaults(func=cmd_secretize)
 
-    p = sub.add_parser("deploy", help="secretize, upload, import and verify")
+    p = sub.add_parser("deploy", help="secretize, diff, import and verify")
     p.add_argument("script")
     p.add_argument("--host", required=True)
     p.add_argument("--user", default="admin")
@@ -1423,6 +1737,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset", action="store_true",
                    help="reset-configuration with the script (destructive)")
     p.add_argument("--yes", action="store_true", help="confirm --reset")
+    p.add_argument("--prune", action="store_true",
+                   help="apply the operations that delete as well: the patch "
+                        "then takes the device to exactly the script, including "
+                        "removing what the script does not declare (the "
+                        "management address and the ethernet interfaces are "
+                        "declared by /export and not by most scripts)")
+    p.add_argument("--import-whole", action="store_true",
+                   help="import the whole script instead of its difference: the "
+                        "path for a device whose /export the differ cannot read, "
+                        "and the one that is not idempotent")
+    p.add_argument("--check", action="store_true",
+                   help="print the difference and exit (1 if there is one, 0 if "
+                        "the device already holds the configuration); nothing is "
+                        "uploaded -- the first run against a live router")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="apply the part of the target the differ can express even "
+                        "though the rest cannot be reached (a menu with no stable "
+                        "handle, a property RouterOS cannot unset, a line it cannot "
+                        "model); without it such a plan is refused, because the "
+                        "deploy would report success for a partly-configured device")
+    p.add_argument("--command-timeout", type=int, default=120, metavar="SECONDS",
+                   help="how long one command may run before the device is called "
+                        "wedged (default: 120); an export of a large configuration "
+                        "is the command that needs more")
     p.add_argument("--wait", type=int, default=180,
                    help="seconds to wait for a reset device (default: 180)")
     p.add_argument("--verify", action="store_true",
@@ -1441,6 +1779,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--known-hosts", metavar="PATH",
                    help="known_hosts file ssh records host keys in (default: "
                         "the operator's ~/.ssh/known_hosts)")
+    p.add_argument("--command-timeout", type=int, default=120, metavar="SECONDS",
+                   help="how long one command may run before the device is called "
+                        "wedged (default: 120)")
     p.set_defaults(func=cmd_diff)
 
     return parser

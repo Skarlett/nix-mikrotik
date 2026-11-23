@@ -15,9 +15,27 @@ nix run .#chr-lab -- stop
 ```
 
 `chr-a` is reachable at `127.0.0.1:2201` (ssh) and `127.0.0.1:8081` (REST),
-`chr-b` at `2202`/`8082`. Their link is QEMU's tcp socket backend, not a tap:
-no root, and ~1.5-2 Gbit/s between the two, where UDP (`dgram`) collapses to
-~50-130 Mbit/s.
+`chr-b` at `2202`/`8082`. `ether1` is each router's management NIC -- the CHR's
+default configuration runs its dhcp-client there, which is how the host reaches
+it -- and `ether2` is the link between the two. The link is QEMU's tcp socket
+backend, not a tap: no root, and ~1.5-2 Gbit/s between the two, where UDP
+(`dgram`) collapses to ~50-130 Mbit/s.
+
+Those are defaults. Every port is settable, because a host runs more than one
+lab at a time -- a second checkout, another agent, a device somebody started by
+hand -- and a second lab on the default ports either refuses to start or, worse,
+answers on a port the first lab believes is its own:
+
+```sh
+CHR_LAB_STATE=$PWD/lab2 \
+CHR_LAB_LINK_PORT=15511 \
+CHR_LAB_SSH_A=2301 CHR_LAB_SSH_B=2302 \
+CHR_LAB_WWW_A=8181 CHR_LAB_WWW_B=8182 \
+  nix run .#chr-lab -- start
+```
+
+`chr-lab status` prints the ports the lab is actually using, so a shell that
+inherits the overrides does not have to remember them.
 
 Two things about CHR that cost time if you do not know them:
 
@@ -48,6 +66,14 @@ build itself can. What it asserts, all read over REST afterwards:
   all only if the whole script ran, because unquoted that base64 `=` padding
   makes the device refuse the script from its first line;
 * the uploaded copy is gone from the device afterwards;
+* that a **second deploy of the same script** is a plan of `set`s — `0 add`,
+  nothing duplicated — and that a **one-property change** reaches the device as a
+  `set` on the object that was already there (same `.id`, so peers and routes
+  pointing at it are not disturbed);
+* and the contrast: re-importing the whole script (`--import-whole`, the path
+  `deploy` used to take) **fails** on a device that already holds it
+  (`failure: already have interface with such name`), which is what makes the
+  convergence above a check rather than a claim;
 * and, the other way round, that a deliberately broken script **fails** the
   deploy, with the device's own `script error: expected end of command` in the
   log and nothing applied. A check whose subject always applies cannot be shown
