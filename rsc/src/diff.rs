@@ -392,6 +392,33 @@ fn is_derived(menu: &str, key: &str) -> bool {
     )
 }
 
+/// How many objects of a section a selector addresses.
+///
+/// A composite key is built from the parts an object *carries*, so an object
+/// missing one part has a selector that is also satisfied by its neighbours: a
+/// route with no `routing-mark` shares `dst-address`+`gateway` with the marked
+/// one, and `remove [find dst-address=… gateway=…]` deletes both. The patch would
+/// say one removal and the device would do two, which is the failure this
+/// counts for.
+fn selector_hits(sel: &Selector, objects: &[Object]) -> usize {
+    objects
+        .iter()
+        .filter(|o| match sel {
+            Selector::Find(pairs) => pairs.iter().all(|(k, v)| {
+                crate::model::prop_text(&o.props, k) == Some(v.as_str())
+            }),
+            Selector::Named(n) => {
+                crate::model::prop_text(&o.props, "name") == Some(n.as_str())
+                    || o.selector.key() == sel.key()
+            }
+            Selector::Comment(c) => {
+                crate::model::prop_text(&o.props, "comment") == Some(c.as_str())
+            }
+            _ => o.selector.key() == sel.key(),
+        })
+        .count()
+}
+
 /// Whether every property in `props` is absent from the live object.
 ///
 /// Absent is not the same as different: a property the export does not carry
@@ -754,6 +781,17 @@ fn diff_keyed(
                     // target's own text: that is exact by construction. The
                     // remove comes first because `add name=x` on an existing
                     // x is refused.
+                    if selector_hits(&obj_a.selector, &a.objects) > 1 {
+                        // The selector also addresses a neighbour, so this
+                        // removal would take both. Nothing here can address the
+                        // object on its own.
+                        out.notes.push(format!(
+                            "UNAPPLIED: {} cannot be re-created -- its selector also addresses \
+                             another object in this menu, so the removal would delete both",
+                            obj_a.selector
+                        ));
+                        continue;
+                    }
                     replaces.push((
                         index_of(&obj_a.selector),
                         vec![
@@ -793,6 +831,14 @@ fn diff_keyed(
 
     for obj_a in &a.objects {
         if b.object(&obj_a.selector).is_none() {
+            if selector_hits(&obj_a.selector, &a.objects) > 1 {
+                out.notes.push(format!(
+                    "UNAPPLIED: {} cannot be removed -- its selector also addresses another \
+                     object in this menu, so the removal would delete both",
+                    obj_a.selector
+                ));
+                continue;
+            }
             removes.push((
                 index_of(&obj_a.selector),
                 vec![Op::Remove {
@@ -1278,6 +1324,38 @@ mod tests {
             "{:?}",
             preamble.notes
         );
+    }
+
+    /// A composite key is built from the parts an object carries, so an object
+    /// missing one part has a selector its neighbour also satisfies. A removal
+    /// with that selector would delete both while the patch said one -- measured
+    /// shape: `/interface bridge port` keyed on `bridge`+`interface`, with one
+    /// port object that has no `interface`.
+    #[test]
+    fn a_selector_that_would_take_two_objects_is_refused() {
+        let diff = d(
+            "/interface bridge port\nadd bridge=br interface=ether1\nadd bridge=br\n",
+            "/interface bridge port\nadd bridge=br interface=ether1\n",
+        );
+        let section = &diff.sections[0];
+        assert!(section.ops.is_empty(), "{:?}", section.ops);
+        assert!(
+            section
+                .notes
+                .iter()
+                .any(|n| n.starts_with("UNAPPLIED:") && n.contains("delete both")),
+            "{:?}",
+            section.notes
+        );
+
+        // The control: with the missing part present, the same removal is a
+        // find that names one object, and it is emitted.
+        let unique = d(
+            "/interface bridge port\nadd bridge=br interface=ether1\nadd bridge=br interface=ether2\n",
+            "/interface bridge port\nadd bridge=br interface=ether1\n",
+        );
+        assert_eq!(unique.sections[0].ops.len(), 1, "{:?}", unique.sections[0].ops);
+        assert!(unique.sections[0].notes.iter().all(|n| !n.starts_with("UNAPPLIED:")));
     }
 
     #[test]

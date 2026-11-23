@@ -295,6 +295,250 @@ fn every_argument_of_every_menu_parses_and_re_renders() {
     }
 }
 
+/// Every menu the identity table keys on *several* properties has to behave like
+/// a keyed menu, not a list: a one-property change is one `set` whose selector
+/// names every key part the object carries, and a removal takes out exactly one
+/// object.
+///
+/// This is the failure the composite half of the table exists for. A selector
+/// that lost a part removes every object sharing the rest -- `/ipv6 firewall
+/// address-list` keyed on `address` alone takes an entry out of every list that
+/// holds it -- and the patch then says one `remove` while the device loses
+/// several. It is also where the fleet's CRS exports live: the switch menus key
+/// on `vlan-id`, or on `ports`+`customer-vid`, and have no name at all.
+#[test]
+fn every_composite_menu_keys_on_all_of_its_parts() {
+    use rsc::diff::{diff, Op, Options, Strategy};
+    use rsc::model::Selector;
+    use rsc::simulate;
+
+    let mut checked: Vec<String> = Vec::new();
+    for menu in table() {
+        let Identity::Composite(keys) = identity_for(menu.header().as_str()) else {
+            continue;
+        };
+        if menu.kind != "list" {
+            continue;
+        }
+        // Only keys the device reports as arguments can be generated, and a menu
+        // with no other property cannot express a "change something else".
+        if keys.iter().any(|k| !menu.attrs.iter().any(|a| a == k)) {
+            continue;
+        }
+        let Some(other) = menu.attrs.iter().find(|a| !keys.contains(&a.as_str())) else {
+            continue;
+        };
+
+        // Three objects: A and B share every key part but the last, C shares the
+        // last with A. A selector missing a part would match two of them. (A menu
+        // keyed on one property is included: A and B differ in it, C differs
+        // again -- the single-key composite is still a composite.)
+        let last_index = keys.len() - 1;
+        let obj = |which: &str, other_v: &str| -> String {
+            let mut parts: Vec<String> = Vec::new();
+            for (i, k) in keys.iter().enumerate() {
+                let v = match which {
+                    "A" if i == last_index => "1",
+                    "B" if i == last_index => "2",
+                    "C" if i == 0 => "c",
+                    "C" if i == last_index => "1",
+                    _ => "shared",
+                };
+                parts.push(format!("{}={}", k, v));
+            }
+            parts.push(format!("{}={}", other, other_v));
+            parts.join(" ")
+        };
+        let header = menu.header();
+        let a = format!(
+            "/{}\nadd {}\nadd {}\nadd {}\n",
+            header,
+            obj("A", "one"),
+            obj("B", "two"),
+            obj("C", "three"),
+        );
+
+        // 1. a one-property change on B is one `set`, not a rebuild
+        let changed = format!(
+            "/{}\nadd {}\nadd {}\nadd {}\n",
+            header,
+            obj("A", "one"),
+            obj("B", "changed"),
+            obj("C", "three"),
+        );
+        let opts = Options::default();
+        let ca = parse_config(&a).unwrap();
+        let cb = parse_config(&changed).unwrap();
+        let d = diff(&ca, &cb, &opts);
+        let section = &d.sections[0];
+        assert_eq!(
+            section.strategy,
+            Strategy::Keyed,
+            "{}: a composite key fell back to {:?}",
+            menu.path,
+            section.strategy
+        );
+        assert_eq!(
+            section.ops.len(),
+            1,
+            "{}: one property change produced {:?}",
+            menu.path,
+            section.ops
+        );
+        match &section.ops[0] {
+            Op::Set { selector, .. } => {
+                let Selector::Find(pairs) = selector else {
+                    panic!("{}: selector is {:?}, not a find", menu.path, selector)
+                };
+                let named: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+                for k in keys {
+                    assert!(
+                        named.contains(k),
+                        "{}: the selector {named:?} does not name the key part {k}",
+                        menu.path
+                    );
+                }
+            }
+            other => panic!("{}: a change became {:?}", menu.path, other.describe()),
+        }
+        // ... and it applies to exactly one object
+        let applied = simulate::apply(&ca, &d);
+        assert_eq!(
+            applied.section(&header).unwrap().objects.len(),
+            3,
+            "{}: the patch changed the object count",
+            menu.path
+        );
+
+        // 2. a removal takes out exactly one object, and the right one
+        let removed = format!(
+            "/{}\nadd {}\nadd {}\n",
+            header,
+            obj("A", "one"),
+            obj("B", "two"),
+        );
+        let cr = parse_config(&removed).unwrap();
+        let dr = diff(&ca, &cr, &opts);
+        let section = &dr.sections[0];
+        assert_eq!(
+            section.ops.len(),
+            1,
+            "{}: one removal produced {:?}",
+            menu.path,
+            section.ops
+        );
+        match &section.ops[0] {
+            Op::Remove { selector, exact, .. } => {
+                assert!(*exact, "{}: the removal is positional", menu.path);
+                let Selector::Find(pairs) = selector else {
+                    panic!("{}: selector is {:?}, not a find", menu.path, selector)
+                };
+                let named: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+                for k in keys {
+                    assert!(
+                        named.contains(k),
+                        "{}: the removal names {named:?} but not the key part {k} -- \
+                         it would delete every object sharing the rest",
+                        menu.path
+                    );
+                }
+            }
+            other => panic!("{}: a removal became {:?}", menu.path, other.describe()),
+        }
+        let applied = simulate::apply(&ca, &dr);
+        let left = &applied.section(&header).unwrap().objects;
+        assert_eq!(left.len(), 2, "{}: the patch removed the wrong number", menu.path);
+        let texts: Vec<String> = left.iter().map(|o| o.selector.key()).collect();
+        assert!(
+            !texts.iter().any(|t| t.contains(&format!("{}={}", keys[0], "c"))),
+            "{}: C survived a removal aimed at it: {texts:?}",
+            menu.path
+        );
+        // 3. An object that *lacks* one of its key parts must not be removed by a
+        //    selector that also matches its neighbour. `/ip route` is the live
+        //    case: `routing-mark` is optional, so a marked and an unmarked route
+        //    can share dst-address and gateway. A `remove [find …]` built from
+        //    the parts that are present then deletes both while the patch says
+        //    one.
+        if keys.len() > 1 {
+            let sparse = format!(
+                "/{}\nadd {}\nadd {}\n",
+                header,
+                obj("A", "one"),
+                {
+                    let mut parts: Vec<String> = Vec::new();
+                    for (i, k) in keys.iter().enumerate() {
+                        if i == last_index {
+                            continue;                 // the optional part is absent
+                        }
+                        let v = if i == 0 { "shared" } else { "shared" };
+                        parts.push(format!("{}={}", k, v));
+                    }
+                    parts.push(format!("{}=two", other));
+                    parts.join(" ")
+                }
+            );
+            let keep = format!("/{}\nadd {}\n", header, obj("A", "one"));
+            let cs = parse_config(&sparse).unwrap();
+            let ck = parse_config(&keep).unwrap();
+            let ds = diff(&cs, &ck, &opts);
+            let applied = simulate::apply(&cs, &ds);
+            let survivors = &applied.section(&header).unwrap().objects;
+            // The object the target kept is the one *with* the last key part. If
+            // the removal matched the neighbour instead, the survivor is the
+            // sparse one -- and on a device `remove [find k1=shared]` deletes
+            // both, so the model and the device would disagree in the worst way.
+            // Two answers are correct, and one is not. Removing exactly the
+            // object the target dropped is correct; so is refusing, because the
+            // selector cannot name it without naming its neighbour. Deleting the
+            // neighbour *and* saying one is the failure.
+            let refused = ds.sections[0]
+                .notes
+                .iter()
+                .any(|n| n.starts_with("UNAPPLIED:"));
+            let kept_the_right_one = survivors.len() == 1
+                && rsc::model::prop_text(&survivors[0].props, keys[last_index]) == Some("1");
+            assert!(
+                refused || kept_the_right_one,
+                "{}: a removal aimed at the object with no {} took the wrong object(s) \
+                 without saying so: {:?} (ops: {:?})",
+                menu.path,
+                keys[last_index],
+                survivors.iter().map(|o| o.selector.key()).collect::<Vec<_>>(),
+                ds.sections[0].ops.iter().map(|o| o.describe()).collect::<Vec<_>>()
+            );
+        }
+
+        checked.push(menu.path.clone());
+    }
+    // A count is not enough: the menus that matter most are the ones the fleet
+    // actually exports. Every composite menu whose key parts are arguments is
+    // exercised; the switch menus are skipped only where the table does not
+    // report their key as an argument, and that is a gap worth knowing about
+    // rather than a pass.
+    for known in [
+        "/ip address",
+        "/ipv6 address",
+        "/ip firewall address-list",
+        "/ipv6 firewall address-list",
+        "/interface list member",
+        "/interface bridge port",
+    ] {
+        assert!(
+            checked.iter().any(|p| p == known),
+            "{} was not exercised (checked: {:?})",
+            known,
+            checked
+        );
+    }
+    assert!(
+        checked.len() >= 8,
+        "only {} composite menus were exercised: {:?}",
+        checked.len(),
+        checked
+    );
+}
+
 /// The multi-value arguments the table records have to be usable as written: a
 /// comma-joined value is one token, and the model keeps it as one property.
 #[test]
