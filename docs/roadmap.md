@@ -3,6 +3,9 @@
 The gaps that are deliberate, what would close each, and the two that are
 measured on a device rather than assumed.
 
+The procedure for working on these, and the ordered backlog with a "done when"
+for each, is in [The hardening campaigns](hardening-campaigns.md).
+
 * **one RouterOS version, not two**: the menu table is walked from 7.25, while
   `chr/default.nix` pins 7.15.3 for the lab and `checks.chr-deploy`. A menu the
   fleet uses can therefore be in the table and absent from the device the
