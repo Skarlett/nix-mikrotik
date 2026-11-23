@@ -94,7 +94,16 @@ pub fn render(diff: &Diff, opts: &RenderOptions) -> String {
     }
 
     if diff.is_empty() {
-        out.push_str("# nothing to do: the configurations are equivalent\n");
+        // "Equivalent" is a claim about the two files. When operations were
+        // withheld it is false: the files differ, and this patch chose not to
+        // say so with a command.
+        if stats.withheld > 0 {
+            out.push_str(
+                "# nothing to apply: every operation this diff found is withheld above\n",
+            );
+        } else {
+            out.push_str("# nothing to do: the configurations are equivalent\n");
+        }
     }
 
     if let Some(marker) = &opts.sentinel {

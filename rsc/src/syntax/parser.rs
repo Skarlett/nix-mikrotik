@@ -114,7 +114,21 @@ fn logical_lines(src: &str) -> Vec<Logical> {
     let mut sep = false;
     let mut strip_lead = false;
 
-    for (idx, phys) in src.split_inclusive('\n').enumerate() {
+    // Lookahead for the dangling-`=` rule below: a physical line is only a
+    // continuation of the previous one when it is indented, which is how
+    // `/export` writes one.
+    let physical: Vec<&str> = src.split_inclusive('\n').collect();
+    let indented = |idx: usize| -> bool {
+        physical
+            .get(idx + 1)
+            .map(|next| {
+                let text = next.trim_end_matches('\n').trim_end_matches('\r');
+                !text.trim().is_empty() && text.starts_with([' ', '\t'])
+            })
+            .unwrap_or(false)
+    };
+
+    for (idx, phys) in physical.iter().enumerate() {
         let line_no = idx + 1;
         let content = phys.trim_end_matches('\n').trim_end_matches('\r');
 
@@ -137,8 +151,19 @@ fn logical_lines(src: &str) -> Vec<Logical> {
         let trimmed = chunk.trim_end();
         let comment = !in_quote && trimmed.trim_start().starts_with('#');
         let backslash = !comment && ends_with_unescaped_backslash(trimmed);
-        let dangling_eq =
-            !comment && !in_quote && trimmed.ends_with('=') && !trimmed.ends_with("==");
+        // A line that ends in `=` may be a value `/export` wrapped after the
+        // `=`, or it may be a value that simply ends in `=` -- every base64 key
+        // does, and so does a `copy-from=<base64>` written by hand. Only the
+        // first continues: a continuation is indented, and a command never is.
+        // Without this, `add name=a key=QUFB...=` followed by `add name=b`
+        // becomes ONE object carrying b's properties, and b is never created --
+        // a patch that silently drops a configuration line instead of refusing
+        // it.
+        let dangling_eq = !comment
+            && !in_quote
+            && trimmed.ends_with('=')
+            && !trimmed.ends_with("==")
+            && indented(idx);
 
         if backslash {
             let without = &trimmed[..trimmed.len() - 1];
@@ -429,6 +454,48 @@ mod tests {
             panic!("not a command")
         };
         assert_eq!(cmd.arg("public-key").unwrap().text, "abc=");
+    }
+
+    /// A value that simply ends in `=` is not a wrapped line: every base64 key
+    /// ends in its padding, and `add name=a copy-from=QUFB…=` followed by
+    /// `add name=b` is two commands. Joining them makes one object that carries
+    /// b's properties, and b is never created -- a configuration line silently
+    /// lost, and a patch that then "converges" without it.
+    #[test]
+    fn a_value_ending_in_equals_does_not_swallow_the_next_command() {
+        let src = "add name=a copy-from=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\n\
+                   add name=b mtu=1420\n";
+        let doc = parse(src).unwrap();
+        assert_eq!(doc.items.len(), 2, "{:?}", doc.items.len());
+        let Item::Command(first) = &doc.items[0] else {
+            panic!("not a command")
+        };
+        let Item::Command(second) = &doc.items[1] else {
+            panic!("not a command")
+        };
+        assert_eq!(
+            first.arg("copy-from").unwrap().text,
+            "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="
+        );
+        assert!(first.arg("mtu").is_none(), "the next command was swallowed");
+        assert_eq!(second.arg("name").unwrap().text, "b");
+        assert_eq!(second.arg("mtu").unwrap().text, "1420");
+    }
+
+    /// ... and the continuation `/export` really writes -- an indented chunk --
+    /// still joins, so the fix above cannot lose a wrapped value.
+    #[test]
+    fn an_indented_chunk_after_an_equals_still_joins() {
+        let src = "add name=a copy-from=\n    QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\nadd name=b\n";
+        let doc = parse(src).unwrap();
+        let Item::Command(first) = &doc.items[0] else {
+            panic!("not a command")
+        };
+        assert_eq!(
+            first.arg("copy-from").unwrap().text,
+            "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="
+        );
+        assert_eq!(doc.items.len(), 2);
     }
 
     #[test]

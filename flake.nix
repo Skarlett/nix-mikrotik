@@ -320,6 +320,18 @@
             # the patch to the model of the first file yields the second). It
             # runs in the package's check phase, so this check is that build.
             rsc = config.packages.rsc;
+
+            # ... and the same property fuzzed: generated scripts from the menu
+            # table the device reports, every ordered pair through diff, patch,
+            # verify (both modes) and the JSON report. A fixed seed, so a failure
+            # is reproducible; `tests/fuzz-rsc.py` is the same tool by hand.
+            rsc-fuzz = pkgs.runCommand "check-rsc-fuzz" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+              cd ${./.}
+              python3 tests/fuzz-rsc.py ${config.packages.rsc}/bin/rsc \
+                --cases 200 --seed 1 --root ${./.} > "$out" 2>&1 || {
+                  cat "$out" >&2; exit 1; }
+              cat "$out"
+            '';
           };
 
           devShells.default = pkgs.mkShell {

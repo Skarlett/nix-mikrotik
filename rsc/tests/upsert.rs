@@ -303,7 +303,7 @@ fn an_upsert_leaves_a_rebuild_it_cannot_finish_alone() {
     assert_eq!(filter.withheld.len(), 3, "{:?}", filter.withheld);
     assert!(problems.is_empty(), "{}", problems.join("\n"));
     assert!(!text.contains("\nadd chain"), "an add from a rebuild reached the patch:\n{}", text);
-    assert!(text.contains("# note: not applied"), "{}", text);
+    assert!(text.contains("# note: UNAPPLIED"), "{}", text);
 }
 
 /// A replacement is a remove plus an add: keeping the add alone would duplicate

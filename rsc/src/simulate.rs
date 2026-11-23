@@ -180,7 +180,7 @@ fn apply_op(cfg: &mut Config, op: &Op) {
 /// "upsert" means, and is reported by the diff as withheld rather than here.
 pub fn compare(expected: &Config, actual: &Config, diff: &Diff, opts: &Options) -> Vec<String> {
     if opts.removals == Removals::Withhold {
-        return compare_upsert(expected, actual, opts);
+        return compare_upsert(expected, actual, diff, opts);
     }
     let mut out = Vec::new();
 
@@ -247,14 +247,41 @@ pub fn compare(expected: &Config, actual: &Config, diff: &Diff, opts: &Options) 
 /// different object on the two sides. Extra objects, extra properties and the
 /// order of a list are not failures here — they are the objects the patch was
 /// told to leave alone, and the diff reports them as withheld.
-fn compare_upsert(expected: &Config, actual: &Config, opts: &Options) -> Vec<String> {
+///
+/// Two kinds of object are exempt, because the patch itself says it did not
+/// reach them and the diff already names them: an object whose *re-creation* was
+/// withheld (a property had to disappear, which RouterOS can only do by
+/// removing the object), and every object in a menu whose rebuild was withheld.
+/// Without the exemption `verify --upsert` would fail on the tool's own honest
+/// refusal, which is how a real mismatch would hide.
+fn compare_upsert(expected: &Config, actual: &Config, diff: &Diff, opts: &Options) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut skipped_objects: HashSet<(String, String)> = HashSet::new();
+    let mut skipped_sections: HashSet<String> = HashSet::new();
+    for (path, op) in diff.withheld() {
+        if let Some(selector) = op.selector() {
+            if selector.is_positional() {
+                skipped_sections.insert(path.to_string());
+            } else {
+                skipped_objects.insert((path.to_string(), selector.key()));
+            }
+        }
+    }
+
     let mut out = Vec::new();
     for section in &expected.sections {
+        if skipped_sections.contains(&section.path) {
+            continue;
+        }
         let Some(got) = actual.section(&section.path) else {
             out.push(format!("/{}: missing entirely", section.path));
             continue;
         };
         for want in &section.objects {
+            if skipped_objects.contains(&(section.path.clone(), want.selector.key())) {
+                continue;
+            }
             let props: Vec<&Prop> = want
                 .props
                 .iter()
@@ -274,10 +301,15 @@ fn compare_upsert(expected: &Config, actual: &Config, opts: &Options) -> Vec<Str
                     .map(|p| format!("{}={}", p.key, p.value.text))
                     .collect::<Vec<_>>()
                     .join(" ");
-                out.push(format!(
-                    "/{}: expected {} {}",
-                    section.path, want.selector, body
-                ));
+                // The selector is the object's name for a keyed menu, and the
+                // props already carry it: printing both says `name=x name=x`.
+                let key = want.selector.key();
+                let shown = if body.contains(&key) {
+                    body
+                } else {
+                    format!("{} {}", want.selector, body)
+                };
+                out.push(format!("/{}: expected {}", section.path, shown));
             }
         }
     }
