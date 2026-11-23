@@ -938,6 +938,16 @@ pkgs.runCommand "check-cli" { } ''
   assert "no stable handle" in gaps[0], gaps
   assert module.unapplied("/ip pool\n  note: 1 removal(s) withheld\n") == []
 
+  # "Converged" is the one line a drift gate branches on: it is present only
+  # when every operation left writes a value `/export` cannot show. Counting
+  # operations instead made a correct device report `2 set` forever.
+  assert module.converged(
+      "  2 operations: 0 add, 2 set, 0 remove, 0 replace, 0 move, 0 unperformable\n"
+      "  converged: the device holds this configuration; 2 value(s) /export "
+      "cannot show are re-asserted\n")
+  assert not module.converged(
+      "  1 operations: 0 add, 1 set, 0 remove, 0 replace, 0 move, 0 unperformable\n")
+
   # An empty script is a broken render, not a request to empty the device.
   empty = os.path.join(work, "empty.rsc")
   with open(empty, "w") as handle:

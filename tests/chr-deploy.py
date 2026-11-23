@@ -736,6 +736,17 @@ def main() -> int:
                           "so the one-property change below would test nothing")
         with open(changed, "w", encoding="utf-8") as handle:
             handle.write(original.replace("listen-port=51820", "listen-port=51821"))
+        # `--check` is the drift gate: 1 while the device differs, 0 once it holds
+        # the script. Before this, a converged device reported `2 set` forever --
+        # the properties `/export` cannot show -- so nothing could branch on it.
+        proc = deploy(args.cli, changed, args.host, args.ssh_port,
+                      os.path.join(workdir, "key"), args.secret, workdir,
+                      generators=args.generators, state_dir=state_dir,
+                      extra=["--check"])
+        output = proc.stdout + proc.stderr
+        run.check("--check reports the changed script as drift (rc 1)",
+                  proc.returncode == 1, f"rc {proc.returncode}")
+        run.contains("... naming the property that differs", output, "listen-port=51821")
         proc = deploy(args.cli, changed, args.host, args.ssh_port,
                       os.path.join(workdir, "key"), args.secret, workdir,
                       generators=args.generators, state_dir=state_dir)
@@ -755,6 +766,20 @@ def main() -> int:
                   bool(re.search(r"\b0 add\b", output)) and bool(re.search(r"\b0 remove\b", output)),
                   " | ".join(l.strip() for l in output.splitlines()
                              if "operations:" in l) or "no summary")
+
+        # ... and now that it is applied, the same script is converged: the only
+        # operations left write values `/export` never carries, so a drift gate
+        # has nothing to fail on.
+        proc = deploy(args.cli, changed, args.host, args.ssh_port,
+                      os.path.join(workdir, "key"), args.secret, workdir,
+                      generators=args.generators, state_dir=state_dir,
+                      extra=["--check"])
+        output = proc.stdout + proc.stderr
+        run.check("--check reports a converged device (rc 0)",
+                  proc.returncode == 0, f"rc {proc.returncode}")
+        run.contains("... saying it is converged", output, "check: converged")
+        run.contains("... and that the rest is a value the export cannot show",
+                     output, "assertions:")
 
         # And the contrast, which is what makes the two above a check: the path
         # this replaces, re-importing the whole script, fails on a device that

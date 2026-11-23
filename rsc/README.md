@@ -14,6 +14,17 @@ rsc patch  <a.rsc> <b.rsc>     those operations as a .rsc script
 rsc verify <a.rsc> <b.rsc>     apply the patch to a in the model and compare
 ```
 
+An operation that only re-states a value `/export` cannot show is printed as
+`assert` rather than `set`, and `rsc diff` says `converged:` when that is all
+that is left — the one line a drift check can branch on:
+
+```
+$ rsc diff live.rsc wanted.rsc --upsert
+  2 operations: 0 add, 2 set, 0 remove, 0 replace, 0 move, 0 unperformable
+  assertions: 2 (the export cannot show these properties, so a diff cannot confirm them)
+  converged: the device holds this configuration; 2 value(s) /export cannot show are re-asserted
+```
+
 `--upsert` changes what the plan may contain: adds and sets only, with every
 operation that would delete withheld and reported (`# withheld: …` in the patch,
 `withheld:` lines in `rsc diff`). That is the mode `nix-mikrotik deploy` uses —

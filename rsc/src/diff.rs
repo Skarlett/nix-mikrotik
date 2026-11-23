@@ -110,6 +110,10 @@ pub enum Op {
         section: String,
         selector: Selector,
         changes: Vec<Prop>,
+        /// Whether this `set` only writes properties the live object does not
+        /// carry at all -- so the export can neither confirm nor refute it.
+        /// See [`Diff::is_assertion_only`].
+        assertion: bool,
     },
     Remove {
         section: String,
@@ -124,7 +128,12 @@ pub enum Op {
         to: usize,
     },
     /// A `set` on a singleton menu.
-    SingletonSet { section: String, changes: Vec<Prop> },
+    SingletonSet {
+        section: String,
+        changes: Vec<Prop>,
+        /// See [`Op::Set`]'s `assertion`.
+        assertion: bool,
+    },
     /// A property the target file drops that no patch can drop.
     Unresolvable {
         section: String,
@@ -143,6 +152,20 @@ impl Op {
             | Op::SingletonSet { section, .. }
             | Op::Unresolvable { section, .. } => section,
         }
+    }
+
+    /// Whether this operation only re-states a value the export cannot show.
+    pub fn is_assertion(&self) -> bool {
+        matches!(
+            self,
+            Op::Set {
+                assertion: true,
+                ..
+            } | Op::SingletonSet {
+                assertion: true,
+                ..
+            }
+        )
     }
 
     /// The object this operation addresses, when it addresses one.
@@ -171,10 +194,16 @@ impl Op {
                 format!("{} {}", what, render_props(props))
             }
             Op::Set {
-                selector, changes, ..
-            } => {
-                format!("set {} {}", selector, render_props(changes))
-            }
+                selector,
+                changes,
+                assertion,
+                ..
+            } => format!(
+                "{} {} {}",
+                if *assertion { "assert" } else { "set" },
+                selector,
+                render_props(changes)
+            ),
             Op::Remove {
                 selector, exact, ..
             } => {
@@ -182,7 +211,13 @@ impl Op {
                 format!("remove {}{}", selector, how)
             }
             Op::Move { selector, to, .. } => format!("move {} to {}", selector, to),
-            Op::SingletonSet { changes, .. } => format!("set {}", render_props(changes)),
+            Op::SingletonSet {
+                changes, assertion, ..
+            } => format!(
+                "{} {}",
+                if *assertion { "assert" } else { "set" },
+                render_props(changes)
+            ),
             Op::Unresolvable { selector, prop, .. } => {
                 format!(
                     "cannot reset {} on {}: RouterOS has no unset",
@@ -214,6 +249,9 @@ pub struct Stats {
     /// (`Options::removals`). Counted separately: they are not part of the
     /// patch, and a reader has to be told they exist.
     pub withheld: usize,
+    /// Of the emitted operations, the ones that only re-state a value the
+    /// device's `/export` cannot show -- see [`Diff::is_assertion_only`].
+    pub asserted: usize,
 }
 
 impl Stats {
@@ -258,6 +296,22 @@ impl Diff {
             total.unresolvable += s.stats.unresolvable;
             total.withheld += s.stats.withheld;
         }
+        // Derived from the operations rather than from a counter the strategies
+        // have to remember to bump: a new place that pushes a `Set` then cannot
+        // forget to classify it.
+        // In properties, the unit the `set` count in the same line uses: one
+        // `set` op can carry a real change and an assertion together, and then
+        // the op is a change (it writes something the device can show).
+        total.asserted = self
+            .sections
+            .iter()
+            .flat_map(|s| s.ops.iter())
+            .filter(|op| op.is_assertion())
+            .map(|op| match op {
+                Op::Set { changes, .. } | Op::SingletonSet { changes, .. } => changes.len(),
+                _ => 0,
+            })
+            .sum();
         total
     }
 
@@ -270,6 +324,48 @@ impl Diff {
         self.sections
             .iter()
             .flat_map(|s| s.withheld.iter().map(move |op| (s.path.as_str(), op)))
+    }
+
+    /// Whether the whole plan only re-states values the device's `/export`
+    /// cannot show.
+    ///
+    /// A device's export omits a WireGuard `private-key` (RouterOS never
+    /// exports it) and every property a script states at its default
+    /// (`disabled=no`). A diff against an export therefore asks for those
+    /// writes forever, and "no operations" is unreachable even on a device that
+    /// holds the configuration. This is the honest question underneath: would a
+    /// deploy change anything the device can report? When the answer is no, a
+    /// drift check has nothing to fail on, and the writes are assertions rather
+    /// than changes.
+    ///
+    /// It is false as soon as anything real is in the plan -- an add, a remove,
+    /// a move, a property that exists with another value, a section the differ
+    /// could not express, or anything withheld.
+    pub fn is_assertion_only(&self) -> bool {
+        // A section the plan could not apply is not converged, whatever else is
+        // in the plan: the target's objects are missing from the device. A
+        // *withheld removal* is different -- it is deliberately not applied, so
+        // the device holds everything the target declares, and the extra objects
+        // are reported on their own line.
+        if self
+            .sections
+            .iter()
+            .any(|s| s.notes.iter().any(|n| n.starts_with("UNAPPLIED:")))
+        {
+            return false;
+        }
+        self.sections.iter().all(|s| {
+            s.ops.iter().all(|op| match op {
+                Op::Set { assertion, .. } | Op::SingletonSet { assertion, .. } => *assertion,
+                // An `Unresolvable` is a property the target drops and no patch
+                // can drop: RouterOS has no unset, and a singleton has no object
+                // to re-create. Nothing a deploy does will remove it, so it is
+                // not something a drift check can fail on -- it is reported as
+                // its own `# rsc: cannot reset …` line.
+                Op::Unresolvable { .. } => true,
+                _ => false,
+            })
+        })
     }
 
     /// Whether every operation the diff emitted is one the device can perform
@@ -294,6 +390,22 @@ fn is_derived(menu: &str, key: &str) -> bool {
         (menu, key),
         ("ip address", "network") | ("ipv6 address", "network")
     )
+}
+
+/// Whether every property in `props` is absent from the live object.
+///
+/// Absent is not the same as different: a property the export does not carry
+/// cannot be compared, so writing it is an assertion -- it may change the
+/// device, or it may already be that value, and no later `/export` will say
+/// which. A property that *is* exported and holds another value is a real
+/// change and stays one.
+fn only_absent(props: &[Prop], live: Option<&Object>) -> bool {
+    let Some(live) = live else {
+        return true;
+    };
+    props
+        .iter()
+        .all(|p| !live.props.iter().any(|q| q.key == p.key))
 }
 
 /// A property that can be reset to its default by writing an empty string.
@@ -550,9 +662,11 @@ fn diff_singleton(
 
     let (changed, removed) = compare(aobj, bobj, path, opts);
     if !changed.is_empty() {
+        let assertion = only_absent(&changed, aobj);
         out.ops.push(Op::SingletonSet {
             section: path.to_string(),
             changes: changed.clone(),
+            assertion,
         });
         out.stats.changed += changed.len();
     }
@@ -590,10 +704,14 @@ fn diff_keyed(
                 // does not exist. Copying it with `add` would invent an object.
                 if obj_b.origin == Origin::Set {
                     out.stats.changed += obj_b.props.len();
+                    // The object is a device default the source only mentions:
+                    // nothing about it is in the live model, so this is an
+                    // assertion by definition.
                     out.ops.push(Op::Set {
                         section: path.to_string(),
                         selector: obj_b.selector.clone(),
                         changes: obj_b.props.clone(),
+                        assertion: true,
                     });
                 } else {
                     adds.push(Op::Add {
@@ -638,10 +756,12 @@ fn diff_keyed(
                     out.stats.replaced += 1;
                 } else if !changed.is_empty() {
                     out.stats.changed += changed.len();
+                    let assertion = only_absent(&changed, Some(obj_a));
                     out.ops.push(Op::Set {
                         section: path.to_string(),
                         selector: obj_a.selector.clone(),
                         changes: changed,
+                        assertion,
                     });
                 }
             }
@@ -689,6 +809,9 @@ fn diff_keyed(
 fn stats_of(ops: &[Op]) -> Stats {
     let mut stats = Stats::default();
     for op in ops {
+        if op.is_assertion() {
+            stats.asserted += 1;
+        }
         match op {
             Op::Add {
                 reason: AddReason::New,
@@ -744,10 +867,12 @@ fn diff_comment_keyed(
                 replace.insert(key.clone());
             } else if !changed.is_empty() {
                 out.stats.changed += changed.len();
+                let assertion = only_absent(&changed, Some(obj_a));
                 sets.push(Op::Set {
                     section: path.to_string(),
                     selector: Selector::Comment(key.clone()),
                     changes: changed,
+                    assertion,
                 });
             }
         }
@@ -817,6 +942,7 @@ fn diff_comment_keyed(
                 section: path.to_string(),
                 selector: Selector::Comment(key.clone()),
                 changes: obj_b.props.clone(),
+                assertion: true,
             });
             continue;
         }
@@ -911,10 +1037,12 @@ fn diff_positional(
                 out.stats.replaced += 1;
             } else if !changed.is_empty() {
                 out.stats.changed += changed.len();
+                let assertion = only_absent(&changed, Some(obj_a));
                 out.ops.push(Op::Set {
                     section: path.to_string(),
                     selector: Selector::Index(i),
                     changes: changed,
+                    assertion,
                 });
             }
         }
@@ -1013,6 +1141,94 @@ mod tests {
         let stats = diff.stats();
         assert_eq!(stats.added, 1);
         assert_eq!(stats.removed, 0);
+    }
+
+    /// A write of a property the live object does not carry is an *assertion*:
+    /// `/export` never shows a WireGuard private key, and it omits a property
+    /// stated at its default, so a diff cannot confirm either one. Counting
+    /// those as changes is what made a converged device report "2 set" forever.
+    #[test]
+    fn a_property_the_export_cannot_show_is_an_assertion() {
+        let diff = d(
+            "/interface wireguard\nadd name=wg0 listen-port=51820\n",
+            "/interface wireguard\nadd name=wg0 listen-port=51820 private-key=\"AAAA=\"\n",
+        );
+        assert_eq!(diff.stats().asserted, 1, "{:?}", diff.stats());
+        assert!(diff.is_assertion_only(), "{:?}", diff.sections);
+        // The command a device is given is still `set` -- `assert` is what the
+        // report calls it. The patch header says how many there are.
+        let text = crate::patch::render(&diff, &crate::patch::RenderOptions::new("a", "b"));
+        assert!(text.contains("# assert: 1 operation(s)"), "{}", text);
+        assert!(text.contains("set [find name=wg0] private-key="), "{}", text);
+        assert!(diff.sections[0].ops[0].describe().starts_with("assert "));
+    }
+
+    /// ... and a property that *is* exported, holding another value, is a change
+    /// -- even when it shares a `set` with an assertion.
+    #[test]
+    fn a_real_change_is_not_an_assertion() {
+        let diff = d(
+            "/interface wireguard\nadd name=wg0 listen-port=51820\n",
+            "/interface wireguard\nadd name=wg0 listen-port=51821\n",
+        );
+        assert_eq!(diff.stats().asserted, 0, "{:?}", diff.stats());
+        assert!(!diff.is_assertion_only());
+
+        // One `set` carrying both: the op writes something the device can show,
+        // so the op is a change and only the assertion's property is counted.
+        let mixed = d(
+            "/interface wireguard\nadd name=wg0 listen-port=51820\n",
+            "/interface wireguard\nadd name=wg0 listen-port=51821 private-key=\"AAAA=\"\n",
+        );
+        assert_eq!(mixed.stats().asserted, 0, "{:?}", mixed.stats());
+        assert!(!mixed.is_assertion_only());
+    }
+
+    /// Anything the device can act on -- an add, a remove, a withheld removal --
+    /// means the plan is not merely re-asserting, whatever else is in it.
+    #[test]
+    fn only_a_plan_of_assertions_is_converged() {
+        let opts = Options::default();
+        let add = d("/ip pool\n", "/ip pool\nadd name=a ranges=1\n");
+        assert!(!add.is_assertion_only());
+
+        // A withheld *removal* is still converged: the plan applies everything
+        // it can, and the extra object is reported as withheld.
+        let withheld = diff(
+            &parse_config("/ip pool\nadd name=a ranges=1\n").unwrap(),
+            &parse_config("/ip pool\n").unwrap(),
+            &Options {
+                removals: Removals::Withhold,
+                ..Options::default()
+            },
+        );
+        assert!(withheld.is_assertion_only(), "{:?}", withheld.sections);
+
+        // A withheld *rebuild* is not: the target's rules are missing from the
+        // device, and no later run would add them.
+        let rebuild = diff(
+            &parse_config(
+                "/ip firewall filter\nadd chain=input action=accept\nadd chain=input action=drop\n",
+            )
+            .unwrap(),
+            &parse_config("/ip firewall filter\nadd chain=input action=accept protocol=icmp\n")
+                .unwrap(),
+            &Options {
+                removals: Removals::Withhold,
+                ..Options::default()
+            },
+        );
+        assert!(!rebuild.is_assertion_only(), "{:?}", rebuild.sections);
+
+        // A property the target drops and RouterOS cannot unset is not
+        // something a deploy can fix, so it does not make the plan "differ".
+        let unresolvable = d("/system note\nset show-at-login=no\n", "");
+        assert_eq!(unresolvable.stats().unresolvable, 1, "{:?}", unresolvable.stats());
+        assert!(unresolvable.is_assertion_only(), "{:?}", unresolvable.sections);
+
+        let empty = d("/ip pool\n", "/ip pool\n");
+        assert!(empty.is_assertion_only());
+        let _ = opts;
     }
 
     #[test]
