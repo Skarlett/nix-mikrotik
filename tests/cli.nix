@@ -958,6 +958,24 @@ pkgs.runCommand "check-cli" { } ''
   assert rc == 2, rc
   assert "no commands" in err.getvalue(), err.getvalue()
 
+  # ------------------------------------------- the uploaded name is per run ----
+  # A device has one flat file store, so a fixed `router-config.rsc` is shared by
+  # every deploy to it: two runs race, and one's cleanup can delete the file the
+  # other is importing. The name carries the run's marker, which is also what
+  # makes a leftover attributable.
+  a, b = module.remote_name("aaa"), module.remote_name("bbb")
+  assert a != b, (a, b)
+  assert a.endswith(".rsc") and b.endswith(".rsc"), (a, b)
+  assert "/" not in a and a.startswith("router-config-"), a
+
+  # Cleanup is a `finally`, so a SIGKILLed deploy leaves the secretized script
+  # on the device. Nothing sweeps it (that would delete a concurrent run's file),
+  # so the next run names it.
+  assert module.stale_warning([]) is None
+  warned = module.stale_warning(["router-config-deadbeef.rsc"])
+  assert "interrupted" in warned and "router-config-deadbeef.rsc" in warned, warned
+  assert "secrets" in warned or "secret" in warned, warned
+
   # --------------------------------------------- --check sends nothing --------
   # `--check` is the first run against a live router: the plan, and no transport
   # at all. The whole-script path has no plan to show, so it is refused.

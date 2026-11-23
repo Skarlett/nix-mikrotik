@@ -56,7 +56,16 @@ import sys
 import tempfile
 import time
 
-DEFAULT_SCRIPT_NAME = "router-config.rsc"
+# The prefix of the file a deploy uploads. The *name* is per run (see
+# `remote_name`): a fixed name meant two deploys to one device shared it, and
+# either one's cleanup could delete the other's file while its import was still
+# reading it.
+SCRIPT_NAME_PREFIX = "router-config"
+
+# The name the renderer writes inside its store path. A derivation's contents are
+# not shared between runs the way a device's flat file store is, so this one is
+# fixed -- and `--import-whole` uploads it under a per-run name all the same.
+RENDERED_SCRIPT_NAME = "router-config.rsc"
 
 # The name between the markers is also a file name in a secrets directory (see
 # README "Clan vars"), so it has to be one: a name carrying a path separator or
@@ -977,6 +986,20 @@ class Router:
         out = self.run('/log print where topics~"script"')
         return [line.strip() for line in out.splitlines() if "script,error" in line]
 
+    def script_files(self) -> list[str]:
+        """The uploaded scripts on the device, by name.
+
+        A name is a name: `/file print` prints an index, a name, a type and a
+        size, and only the `.rsc` entries are ours.
+        """
+        out = self.run(f'/file print where name~"^{SCRIPT_NAME_PREFIX}"')
+        names = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].endswith(".rsc"):
+                names.append(parts[1])
+        return names
+
     def export(self) -> str:
         return self.run("/export terse")
 
@@ -994,7 +1017,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     if out.returncode != 0:
         raise ToolError(f"nix build failed for {attr}:\n{out.stderr.strip()}")
     store_path = out.stdout.strip().splitlines()[-1]
-    source = os.path.join(store_path, DEFAULT_SCRIPT_NAME)
+    source = os.path.join(store_path, RENDERED_SCRIPT_NAME)
     if not os.path.isfile(source):
         raise ToolError(f"{source} does not exist in the build output")
     destination = args.output or f"{args.name}.rsc"
@@ -1181,6 +1204,35 @@ def sentinel_line(marker: str) -> str:
 # --------------------------------------------------------------------------
 # the differ
 # --------------------------------------------------------------------------
+
+def remote_name(marker: str) -> str:
+    """The name a deploy gives its uploaded script: unique per run.
+
+    RouterOS keeps one flat file store, so a fixed `router-config.rsc` is shared
+    by every deploy to that device. Two runs then race: one removes the file
+    while the other's `/import` is reading it, and the failure looks like a
+    device error. The marker is the same random string the sentinel uses, so a
+    leftover can be tied to the run that left it.
+    """
+    return f"{SCRIPT_NAME_PREFIX}-{marker}.rsc"
+
+
+def stale_warning(names: list[str]) -> str | None:
+    """What to say about script files an interrupted run left behind.
+
+    Cleanup is a `finally`, so a deploy that is SIGKILLed (or whose host dies)
+    leaves the *secretized* script -- plaintext secrets -- on the device's flash.
+    Nothing sweeps them: deleting `router-config-*.rsc` would also delete the file
+    a concurrent run is importing. So the next run names them.
+    """
+    if not names:
+        return None
+    return ("warning: the device still holds script file(s) from an interrupted "
+            "deploy, which contain the secret values that were being delivered: "
+            + ", ".join(names)
+            + " -- remove them with `/file remove <name>` once nothing else is "
+              "importing them")
+
 
 def rsc_binary() -> str:
     """The `rsc` differ this tool drives.
@@ -1480,7 +1532,10 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             raise ToolError("--check needs the diff path: do not combine it with "
                             "--import-whole or --reset")
 
-        staged = os.path.join(workdir, DEFAULT_SCRIPT_NAME)
+        stale = stale_warning(router.script_files())
+        if stale:
+            print(stale, file=sys.stderr)
+        staged = os.path.join(workdir, remote_name(marker))
         fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             # The differ already appended the sentinel to a patch; the

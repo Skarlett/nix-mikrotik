@@ -92,6 +92,14 @@ line silently lost, and a patch that then "converges" without it. `/export` writ
 a continuation indented; a command never is, so the indentation is the test. Found
 by fuzzing (`tests/fuzz-rsc.py`), not by reading.
 
+**A `set` with no selector names the menu's single settings object — but only in a
+menu that has one.** In a list menu it names nothing, and modelling it as the
+singleton produced an object the differ then tried to delete with an empty
+selector: a bare `remove`, which RouterOS refuses mid-import (measured: `Script
+Error: missing value(s) of argument(s) numbers`) after applying everything above
+it. Such a line is now kept verbatim as unmodelled and reported (`UNAPPLIED:`), so
+the caller can refuse instead of shipping a half-applied deploy.
+
 ## Identity, which is the actual problem
 
 An `/export` carries no internal ids, so a patch has to name what it changes.

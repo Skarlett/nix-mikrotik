@@ -168,6 +168,17 @@ fn render_op(op: &Op) -> Vec<String> {
             exact,
             ..
         } => {
+            // A singleton has no object to remove, and `remove` with an empty
+            // selector is a command RouterOS refuses -- after applying
+            // everything above it. It should not be reachable now that a
+            // selector-less `set` in a menu of objects is unmodelled, and this
+            // is the belt: a patch never carries a verb with no operand.
+            if matches!(sel, Selector::Singleton) {
+                return vec![
+                    "# rsc: cannot remove a singleton menu -- there is no object to address"
+                        .to_string(),
+                ];
+            }
             let line = format!("remove {}", selector(sel));
             if *exact {
                 vec![line]
@@ -276,6 +287,31 @@ mod tests {
             "{}",
             out
         );
+    }
+
+    /// A removal with no selector is a verb with no operand, which RouterOS
+    /// refuses -- after applying everything above it. Unreachable now that such
+    /// a line is unmodelled, and the renderer refuses to spell it anyway.
+    #[test]
+    fn a_singleton_removal_is_a_comment_not_a_command() {
+        let d = Diff {
+            sections: vec![crate::diff::SectionDiff {
+                path: "ip pool".to_string(),
+                strategy: crate::diff::Strategy::Singleton,
+                ops: vec![Op::Remove {
+                    section: "ip pool".to_string(),
+                    selector: Selector::Singleton,
+                    exact: true,
+                }],
+                stats: crate::diff::Stats::default(),
+                notes: Vec::new(),
+                withheld: Vec::new(),
+            }],
+            notes: Vec::new(),
+        };
+        let out = render(&d, &RenderOptions::new("a", "b"));
+        assert!(out.contains("# rsc: cannot remove a singleton"), "{}", out);
+        assert!(!out.lines().any(|l| l.trim() == "remove"), "{}", out);
     }
 
     #[test]

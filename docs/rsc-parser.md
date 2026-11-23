@@ -133,6 +133,15 @@ that the device writes `set name=chr-diff` where the target had
 `set name="chr-diff"` — the same value, and the semantic diff is zero. That is
 the level at which the two files are compared: quoting is not a difference.
 
+## What a plan refuses to guess at
+
+Three shapes are marked `UNAPPLIED:` rather than patched, because a command whose
+effect the tool cannot describe is worse than no command: a line the model does
+not interpret (a block script, or a `set` with no selector inside a menu of
+objects), a menu that would have to be rebuilt to reach the target, and an object
+whose re-creation needs a property to disappear. `deploy` refuses on all three
+unless told otherwise.
+
 ## What is not here
 
 * **Deletions are opt-in.** `rsc patch --upsert` (and `rsc diff --upsert`) emits

@@ -458,6 +458,14 @@ pub fn diff(a: &Config, b: &Config, opts: &Options) -> Diff {
             .push(diff_section(&section.path, Some(section), None, opts));
     }
 
+    if !b.preamble.is_empty() {
+        out.notes.push(format!(
+            "UNAPPLIED: {} command(s) before the first menu are kept verbatim and cannot be \
+             applied",
+            b.preamble.len()
+        ));
+    }
+
     out
 }
 
@@ -549,6 +557,21 @@ fn diff_section(
         Strategy::Keyed => diff_keyed(path, a, b, opts, &mut out),
         Strategy::CommentKeyed => diff_comment_keyed(path, a, b, opts, &mut out),
         Strategy::Positional => diff_positional(path, a, b, opts, &mut out),
+    }
+
+    // A line the model could not interpret is kept verbatim. In the *target*
+    // that means a configuration line this patch will not apply -- a
+    // selector-less `set` in a menu of objects, a `remove` or `move` a script
+    // carries, anything the parser does not model. Saying so is what lets the
+    // caller refuse instead of reporting a deploy that only half happened; a
+    // line like that on the *live* side is not a problem (nothing to apply).
+    let unmodelled = b.map(|s| s.extras.len()).unwrap_or(0);
+    if unmodelled > 0 {
+        out.notes.push(format!(
+            "UNAPPLIED: {unmodelled} line(s) in this menu are kept verbatim (a selector-less `set` \
+             in a menu of objects, or a command the model does not interpret), and nothing here \
+             is patched for them"
+        ));
     }
 
     if opts.removals == Removals::Withhold {
@@ -1229,6 +1252,32 @@ mod tests {
         let empty = d("/ip pool\n", "/ip pool\n");
         assert!(empty.is_assertion_only());
         let _ = opts;
+    }
+
+    /// A target line the model cannot address is reported, not guessed at: the
+    /// caller refuses a plan containing `UNAPPLIED:`, so a deploy can never
+    /// report success for a line it did not apply.
+    #[test]
+    fn a_target_line_that_cannot_be_addressed_is_unapplied() {
+        let diff = d(
+            "/ip pool\nadd name=a ranges=1\n",
+            "/ip pool\nadd name=a ranges=2\nset comment=x\n",
+        );
+        assert!(
+            diff.sections[0].notes.iter().any(|n| n.starts_with("UNAPPLIED:")),
+            "{:?}",
+            diff.sections[0].notes
+        );
+        let text = crate::patch::render(&diff, &crate::patch::RenderOptions::new("a", "b"));
+        assert!(!text.lines().any(|l| l.trim() == "remove"), "{}", text);
+
+        // A command before the first menu is the same story.
+        let preamble = d("/ip pool\nadd name=a ranges=1\n", ":log info \"x\"\n");
+        assert!(
+            preamble.notes.iter().any(|n| n.starts_with("UNAPPLIED:")),
+            "{:?}",
+            preamble.notes
+        );
     }
 
     #[test]
